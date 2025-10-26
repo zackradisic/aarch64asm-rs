@@ -271,6 +271,7 @@ pub enum Instr {
 
     Ldr(Reg, Reg, Reg),
     LdrImmPostIndex(Reg, Reg, Imm),
+    LdrImmPreIndex(Reg, Reg, Imm),
     LdrhImmPostIndex(Reg, Reg, Imm),
 
     Ldrb(Reg, Reg, Reg),
@@ -327,6 +328,8 @@ const LDR_64: u32 = 0b11111000011_00000_000_0_10_00000_00000;
 /// https://developer.arm.com/documentation/ddi0602/2021-12/Base-Instructions/LDR--immediate---Load-Register--immediate--?lang=en
 const LDR_IMM_POST_INDEX_32: u32 = 0b10111000010_000000000_01_00000_00000;
 const LDR_IMM_POST_INDEX_64: u32 = 0b11111000010_000000000_01_00000_00000;
+const LDR_IMM_PRE_INDEX_32: u32 = 0b10_111000010_000000000_11_00000_00000;
+const LDR_IMM_PRE_INDEX_64: u32 = 0b11_111000010_000000000_11_00000_00000;
 
 const LDRH_IMM_POST_INDEX_32: u32 = 0b01111000010_000000000_01_00000_00000;
 
@@ -511,6 +514,7 @@ impl Assembler {
                 Instr::StrbPostIndex(reg, reg1, imm) => {}
                 Instr::Ldr(reg, reg1, reg2) => {}
                 Instr::LdrImmPostIndex(reg, reg1, imm) => {}
+                Instr::LdrImmPreIndex(reg, reg1, imm) => {}
                 Instr::LdrhImmPostIndex(reg, reg1, imm) => {}
                 Instr::Ldrb(reg, reg1, reg2) => {}
                 Instr::LdrbImmPostIndex(reg, reg1, imm) => {}
@@ -594,6 +598,12 @@ impl Assembler {
         assert!(offset.as_isize() < 256);
         assert!(offset.as_isize() >= -256);
         self.instrs.push(Instr::LdrImmPostIndex(out, base, offset));
+    }
+
+    pub fn ldr_imm_pre_index(&mut self, out: Reg, base: Reg, offset: Imm) {
+        assert!(offset.as_isize() < 256);
+        assert!(offset.as_isize() >= -256);
+        self.instrs.push(Instr::LdrImmPreIndex(out, base, offset));
     }
 
     pub fn ldrh_imm_post_index(&mut self, out: Reg, base: Reg, offset: Imm) {
@@ -1224,6 +1234,23 @@ impl Assembler {
 
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
+            Instr::LdrImmPreIndex(out, base, offset) => {
+                let mut instrbits = if out.is_64bit() {
+                    LDR_IMM_PRE_INDEX_64
+                } else {
+                    LDR_IMM_PRE_INDEX_32
+                };
+
+                let offset_value = offset.as_isize();
+                assert!(offset_value < 256);
+                assert!(offset_value >= -256);
+
+                instrbits.set_bit_range(4, 0, out.as_bits());
+                instrbits.set_bit_range(9, 5, base.as_bits());
+                instrbits.set_bit_range(20, 12, offset_value as u32);
+
+                outbuf.write_all(&instrbits.to_le_bytes())
+            }
             Instr::LdrImmPostIndex(out, base, offset) => {
                 let mut instrbits = if out.is_64bit() {
                     LDR_IMM_POST_INDEX_64
@@ -1656,6 +1683,14 @@ impl Instr {
             Instr::LdrImmPostIndex(out, base, offset) => {
                 format!(
                     "ldr\t{}, [{}], #{}",
+                    out.as_asm(),
+                    base.as_asm(),
+                    offset.as_isize()
+                )
+            }
+            Instr::LdrImmPreIndex(out, base, offset) => {
+                format!(
+                    "ldr\t{}, [{}, #{}]!",
                     out.as_asm(),
                     base.as_asm(),
                     offset.as_isize()
@@ -2240,31 +2275,50 @@ mod test {
             let input: [usize; 2] = [34, 35];
             assert_eq!(func(input.as_ptr()), 69);
         }
+    }
 
-        // {
-        //     let mut asm = Assembler::new();
-        //     asm.ldr_imm_post_index(X1, X0, 0.into());
-        //     asm.ldr_imm_post_index(X2, X0, 8.into());
-        //     asm.sub_imm(SP, SP, Imm::U8(16));
+    #[test]
+    fn test_assembler_ldr_imm_pre_index() {
+        use Reg::*;
 
-        //     asm.stp(X1, X2, SP, 0.into());
-        //     asm.ldp(X1, X2, SP, 0.into());
-        //     asm.add(X0, X1, X2);
-        //     asm.add_imm(SP, SP, Imm::U8(16));
-        //     asm.ret();
+        // Test with positive offset
+        {
+            let mut asm = Assembler::new();
+            // Pre-index: increment X0 by 8, then load from the new address into X1
+            asm.ldr_imm_pre_index(X1, X0, 8.into());
+            // Pre-index: increment X0 by 8 again (now X0 points 16 bytes ahead), then load into X2
+            asm.ldr_imm_pre_index(X2, X0, 8.into());
+            asm.add(X0, X1, X2);
+            asm.ret();
 
-        //     let exec = ExecutableMem::from_bytes_copy(&asm.emit());
-        //     let func = unsafe {
-        //         std::mem::transmute::<*mut c_void, extern "C" fn(*const usize) -> usize>(
-        //             exec.addr,
-        //         )
-        //     };
+            let exec = ExecutableMem::from_bytes_copy(&asm.emit());
+            let func = unsafe {
+                std::mem::transmute::<*mut c_void, extern "C" fn(*const usize) -> usize>(exec.addr)
+            };
 
-        //     let input: [usize; 2] = [0; 2];
-        //     assert_eq!(func(input.as_ptr()), 0);
-        //     let input: [usize; 2] = [34, 35];
-        //     assert_eq!(func(input.as_ptr()), 69);
-        // }
+            let input: [usize; 3] = [0, 34, 35];
+            // X1 loads from input[1] (after incrementing by 8), X2 loads from input[2] (after incrementing by 8 again)
+            assert_eq!(func(input.as_ptr()), 69);
+        }
+
+        // Test with negative offset
+        {
+            let mut asm = Assembler::new();
+            // Start at X0 + 16 (passed as pointer to input[2])
+            asm.ldr_imm_pre_index(X1, X0, (-8).into());  // Decrement by 8, load from input[1]
+            asm.ldr_imm_pre_index(X2, X0, (-8).into());  // Decrement by 8 again, load from input[0]
+            asm.add(X0, X1, X2);
+            asm.ret();
+
+            let exec = ExecutableMem::from_bytes_copy(&asm.emit());
+            let func = unsafe {
+                std::mem::transmute::<*mut c_void, extern "C" fn(*const usize) -> usize>(exec.addr)
+            };
+
+            let input: [usize; 3] = [10, 20, 30];
+            // Start pointer at input[2], X1 loads from input[1], X2 loads from input[0]
+            assert_eq!(func(&input[2] as *const usize), 30);
+        }
     }
 
     #[test]
