@@ -376,6 +376,10 @@ const ADD_IMM_64: u32 = 0b100100010_0_000000000000_00000_00000;
 const SUBS_32: u32 = 0b01101011_00_0_000_00000_0000000_000000;
 const SUBS_64: u32 = 0b11101011_00_0_00000_000000_00000_00000;
 
+/// https://developer.arm.com/documentation/ddi0596/2020-12/Base-Instructions/SUB--shifted-register---Subtract--shifted-register--
+const SUB_32: u32 = 0b0_1001011_00_0_00000_000000_00000_00000;
+const SUB_64: u32 = 0b1_1001011_00_0_00000_000000_00000_00000;
+
 /// https://developer.arm.com/documentation/ddi0596/2020-12/Base-Instructions/SUBS--extended-register---Subtract--extended-register---setting-flags-
 ///
 /// Works with SP as source operand
@@ -398,8 +402,8 @@ const CMP_IMM_64: u32 = 0b111100010_0_000000000000_00000_11111;
 
 const MOV_32: u32 = 0b00101010000_00000_000000_11111_00000;
 const MOV_64: u32 = 0b10101010000_00000_000000_11111_00000;
-const MOV_IMM_32: u32 = 0b0011001000_000000_000000_11111_00000;
-const MOV_IMM_64: u32 = MOVZ_IMM_64;
+const _MOV_IMM_32: u32 = 0b0011001000_000000_000000_11111_00000;
+const _MOV_IMM_64: u32 = MOVZ_IMM_64;
 const MOVK_IMM_64: u32 = 0b111100101_00_0000000000000000_00000;
 
 const MOVZ_IMM_32: u32 = 0b010100101_00_0000000000000000_00000;
@@ -714,6 +718,12 @@ impl Assembler {
         let val = b.as_usize();
         assert!(val <= 4095);
         self.instrs.push(Instr::SubsImm(out, a, b, true));
+    }
+
+    pub fn sub(&mut self, out: Reg, a: Reg, b: Reg) {
+        assert_eq!(out.is_64bit(), a.is_64bit());
+        assert_eq!(a.is_64bit(), b.is_64bit());
+        self.instrs.push(Instr::Sub(out, a, b));
     }
 
     pub fn sub_imm(&mut self, out: Reg, a: Reg, b: Imm) {
@@ -1388,7 +1398,16 @@ impl Assembler {
                 instrbits.set_bit_range(20, 16, b.as_bits());
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
-            Instr::Sub(reg, reg1, reg2) => todo!(),
+            Instr::Sub(dest, a, b) => {
+                assert_eq!(dest.is_64bit(), a.is_64bit());
+                assert_eq!(a.is_64bit(), b.is_64bit());
+
+                let mut instrbits = if dest.is_64bit() { SUB_64 } else { SUB_32 };
+                instrbits.set_bit_range(4, 0, dest.as_bits());
+                instrbits.set_bit_range(9, 5, a.as_bits());
+                instrbits.set_bit_range(20, 16, b.as_bits());
+                outbuf.write_all(&instrbits.to_le_bytes())
+            }
             Instr::SubImm(out, left, right) => {
                 assert!((out.is_32bit() && left.is_32bit()) || (out.is_64bit() && left.is_64bit()));
                 let mut instrbits = if out.is_32bit() {
@@ -1775,7 +1794,7 @@ impl Instr {
     }
 }
 
-fn set_register_bits(instr_bits: &mut u32, reg: Reg) {
+fn _set_register_bits(instr_bits: &mut u32, reg: Reg) {
     let reg_bits = reg.as_bits();
     assert_eq!(reg_bits & !0b11111, 0);
     *instr_bits |= reg_bits;
@@ -2696,6 +2715,53 @@ mod test {
     }
 
     #[test]
+    fn test_assembler_sub() {
+        use Reg::*;
+        {
+            let mut assembler = Assembler::new();
+            assembler.sub(X0, X0, X1);
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<*mut c_void, extern "C" fn(usize, usize) -> usize>(exec.addr)
+            };
+            assert_eq!(func(0, 0), 0);
+            assert_eq!(func(1, 1), 0);
+            assert_eq!(func(4, 2), 2);
+            assert_eq!(func(35, 34), 1);
+        }
+
+        {
+            let mut assembler = Assembler::new();
+            assembler.sub(X0, X1, XZR);
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<*mut c_void, extern "C" fn(usize, usize) -> usize>(exec.addr)
+            };
+            assert_eq!(func(0, 0), 0);
+            assert_eq!(func(0, 1), 1);
+            assert_eq!(func(0, 2), 2);
+            assert_eq!(func(0, 35), 35);
+        }
+
+        {
+            let mut assembler = Assembler::new();
+            assembler.add_imm(X1, SP, 0.into());
+            assembler.add_imm(SP, X1, 0.into());
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr)
+            };
+            assert_eq!(func(0), 0);
+        }
+    }
+
+    #[test]
     fn test_assembler_sub_imm() {
         use Reg::*;
         {
@@ -2865,7 +2931,7 @@ mod test {
         let func =
             unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr) };
 
-        fn expected_fib(mut n: isize) -> usize {
+        fn expected_fib(n: isize) -> usize {
             if n < 2 {
                 return n as usize;
             }
