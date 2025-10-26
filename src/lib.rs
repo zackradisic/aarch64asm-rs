@@ -440,6 +440,10 @@ impl Assembler {
         }
     }
 
+    pub fn pc(&self) -> usize {
+        self.instrs.len()
+    }
+
     pub fn prologue(&mut self) {
         use Reg::*;
         self.str_imm_post_index(X29, SP, 0.into());
