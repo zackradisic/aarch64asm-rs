@@ -113,6 +113,7 @@ pub enum Reg {
     X9,
     X10,
     X11,
+    X22,
     X28,
     X29,
     X30,
@@ -129,6 +130,7 @@ pub enum Reg {
     W9,
     W10,
     W11,
+    W22,
     W28,
     W29,
     W30,
@@ -1827,6 +1829,7 @@ impl Reg {
             Reg::X9 | Reg::W9 => 9,
             Reg::X10 | Reg::W10 => 10,
             Reg::X11 | Reg::W11 => 11,
+            Reg::X22 | Reg::W22 => 22,
             Reg::X28 | Reg::W28 => 28,
             Reg::X29 | Reg::W29 => 29,
             Reg::X30 | Reg::W30 => 30,
@@ -1848,6 +1851,7 @@ impl Reg {
             8 => Reg::X8,
             9 => Reg::X9,
             10 => Reg::X10,
+            22 => Reg::X22,
             29 => Reg::X29,
             30 => Reg::X30,
             _ => panic!("Invalid index for 64-bit register"),
@@ -1887,6 +1891,7 @@ impl Reg {
             Reg::X9 | Reg::W9 => 9,
             Reg::X10 | Reg::W10 => 10,
             Reg::X11 | Reg::W11 => 11,
+            Reg::X22 | Reg::W22 => 22,
             Reg::X28 | Reg::W28 => 28,
             Reg::X29 | Reg::W29 => 29,
             Reg::X30 | Reg::W30 => 30,
@@ -1913,6 +1918,7 @@ impl Reg {
             | Reg::X28
             | Reg::X29
             | Reg::X30
+            | Reg::X22
             | Reg::XZR => true,
             Reg::W0
             | Reg::W1
@@ -1926,6 +1932,7 @@ impl Reg {
             | Reg::W9
             | Reg::W10
             | Reg::W11
+            | Reg::W22
             | Reg::W28
             | Reg::W29
             | Reg::WZR
@@ -1949,6 +1956,7 @@ impl Reg {
             | Reg::W9
             | Reg::W10
             | Reg::W11
+            | Reg::W22
             | Reg::W29
             | Reg::W30
             | Reg::WSP
@@ -1966,6 +1974,7 @@ impl Reg {
             | Reg::X9
             | Reg::X10
             | Reg::X11
+            | Reg::X22
             | Reg::X28
             | Reg::X29
             | Reg::X30
@@ -1988,6 +1997,7 @@ impl Reg {
             Reg::X9 | Reg::W9 => Reg::W9,
             Reg::X10 | Reg::W10 => Reg::W10,
             Reg::X11 | Reg::W11 => Reg::W11,
+            Reg::X22 | Reg::W22 => Reg::W22,
             Reg::X28 | Reg::W28 => Reg::W28,
             Reg::X29 | Reg::W29 => Reg::W29,
             Reg::XZR | Reg::WZR => Reg::WZR,
@@ -2010,6 +2020,7 @@ impl Reg {
             Reg::X9 => "x9",
             Reg::X10 => "x10",
             Reg::X11 => "x11",
+            Reg::X22 => "x22",
             Reg::X28 => "x28",
             Reg::X29 => "x29",
             Reg::X30 => "x30",
@@ -2025,6 +2036,7 @@ impl Reg {
             Reg::W9 => "w9",
             Reg::W10 => "w10",
             Reg::W11 => "w11",
+            Reg::W22 => "w22",
             Reg::W28 => "w28",
             Reg::W29 => "w29",
             Reg::W30 => "w30",
