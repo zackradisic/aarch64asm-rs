@@ -1,3 +1,4 @@
+#![feature(variant_count)]
 use std::ffi::{c_int, c_void};
 
 use std::{collections::HashMap, io::Write, ops::Neg};
@@ -100,6 +101,7 @@ impl CC {
 // frame register: x29 (can't use as a general purpose register)
 // link register: x30  (same)
 #[derive(PartialEq, Clone, Copy, Eq, Debug)]
+#[repr(u8)]
 pub enum Reg {
     X0,
     X1,
@@ -113,7 +115,22 @@ pub enum Reg {
     X9,
     X10,
     X11,
+    X12,
+    X13,
+    X14,
+    X15,
+    X16,
+    X17,
+    X18,
+    X19,
+    X20,
+    X21,
     X22,
+    X23,
+    X24,
+    X25,
+    X26,
+    X27,
     X28,
     X29,
     X30,
@@ -130,7 +147,22 @@ pub enum Reg {
     W9,
     W10,
     W11,
+    W12,
+    W13,
+    W14,
+    W15,
+    W16,
+    W17,
+    W18,
+    W19,
+    W20,
+    W21,
     W22,
+    W23,
+    W24,
+    W25,
+    W26,
+    W27,
     W28,
     W29,
     W30,
@@ -255,6 +287,7 @@ pub enum Instr {
 
     Cb(bool, Reg, Label),
     Jump(Label),
+    JumpAddr(i64),
     Branch(CC, Label),
 
     StrImmOffset(Reg, Reg, Imm),
@@ -496,6 +529,7 @@ impl Assembler {
                         self.instrs.pop();
                     }
                 }
+                Instr::JumpAddr(_) => {}
                 Instr::Br(r) => {}
                 Instr::Adr(_, l) => {
                     // TODO: Can we omit this? It owuld
@@ -764,7 +798,6 @@ impl Assembler {
         assert_ne!(source, Reg::SP);
         assert!(base.is_64bit());
         let offset_val = offset.as_isize();
-        println!("offset_val: {}", offset_val);
         assert!(offset_val <= 255);
         assert!(offset_val >= -256);
         self.instrs.push(Instr::StrImmPostIndex(
@@ -778,7 +811,6 @@ impl Assembler {
         assert_ne!(source, Reg::SP);
         assert!(base.is_64bit());
         let offset_val = offset.as_isize();
-        println!("offset_val: {}", offset_val);
         assert!(offset_val <= 255);
         assert!(offset_val >= -256);
         self.instrs.push(Instr::StrImmPreIndex(
@@ -800,6 +832,14 @@ impl Assembler {
 
     pub fn jump(&mut self, label: Label) {
         self.instrs.push(Instr::Jump(label));
+    }
+
+    /// Must be in the range of +/-128mb, use `branch_register` if you need to
+    /// jump to offsets larger than that.
+    pub fn jump_addr(&mut self, addr: i64) {
+        assert!(addr >= -1024 * 128);
+        assert!(addr <= 1024 * 128);
+        self.instrs.push(Instr::JumpAddr(addr));
     }
 
     pub fn branch_register(&mut self, reg: Reg) {
@@ -882,7 +922,6 @@ impl Assembler {
 
         let mut hw = 0;
         while val != 0 {
-            println!("val: {}", val);
             assert!(hw < 4);
             let instr = if hw == 0 {
                 Instr::MovzImm(reg, Imm::U32((val & 0xFFFF) as u32), hw)
@@ -900,7 +939,6 @@ impl Assembler {
     }
 
     pub fn emit(&mut self) -> Vec<u8> {
-        println!("instrs:\n{}", self.as_asm());
         for (label, idx) in self.labels.iter() {
             if *idx == usize::MAX {
                 panic!("Label not patched: {}", label);
@@ -950,7 +988,6 @@ impl Assembler {
                 let mut instr_bits = ADR;
 
                 let label_index = l.as_bits(idx, &self.labels) as i64;
-                println!("label_index: {}", label_index);
 
                 let label_bits_signed: i64 = label_index * 4;
                 // Must be in the range of +/-1mb
@@ -993,6 +1030,14 @@ impl Assembler {
                 let label_bits = label.as_bits(idx, &self.labels);
                 instr_bits.set_bit_range(23, 5, label_bits);
                 outbuf.write_all(&instr_bits.to_le_bytes())?;
+                Ok(())
+            }
+            Instr::JumpAddr(addr) => {
+                assert!(*addr >= -1024 * 128);
+                assert!(*addr <= 1024 * 128);
+                let mut instrbits = B;
+                instrbits.set_bit_range(25, 0, *addr as u32);
+                outbuf.write_all(&instrbits.to_le_bytes())?;
                 Ok(())
             }
             Instr::Jump(label) => {
@@ -1826,6 +1871,7 @@ impl Instr {
                     hw * 16
                 )
             }
+            Instr::JumpAddr(addr) => format!("b\t#{}", addr),
             Instr::Ret => "ret".to_string(),
         }
     }
@@ -1843,13 +1889,46 @@ impl Label {
         assert_ne!(dest_addr_offset, usize::MAX);
         // let result = (self.1 - pc) >> 2;
         let result = dest_addr_offset as isize - current_addr_offset as isize;
-        println!("{} result: {}", self.0, result);
         assert!(result < (1 << 20));
         return result as i64;
     }
 }
 
 impl Reg {
+    pub fn iter_all() -> impl Iterator<Item = Reg> {
+        let max = std::mem::variant_count::<Reg>() - 1;
+        (0..max).map(|i| unsafe { std::mem::transmute::<u8, Reg>(i as u8) })
+    }
+
+    // AAPCS64
+    pub fn is_callee_saved_aapcs64(self) -> bool {
+        match self {
+            Reg::X19
+            | Reg::X20
+            | Reg::X21
+            | Reg::X22
+            | Reg::X23
+            | Reg::X24
+            | Reg::X25
+            | Reg::X26
+            | Reg::X27
+            | Reg::X28
+            | Reg::X29
+            | Reg::W19
+            | Reg::W20
+            | Reg::W21
+            | Reg::W22
+            | Reg::W23
+            | Reg::W24
+            | Reg::W25
+            | Reg::W26
+            | Reg::W27
+            | Reg::W28
+            | Reg::W29 => true,
+            _ => false,
+        }
+    }
+
     pub fn idx(&self) -> usize {
         match self {
             Reg::X0 | Reg::W0 => 0,
@@ -1864,7 +1943,22 @@ impl Reg {
             Reg::X9 | Reg::W9 => 9,
             Reg::X10 | Reg::W10 => 10,
             Reg::X11 | Reg::W11 => 11,
+            Reg::X12 | Reg::W12 => 12,
+            Reg::X13 | Reg::W13 => 13,
+            Reg::X14 | Reg::W14 => 14,
+            Reg::X15 | Reg::W15 => 15,
+            Reg::X16 | Reg::W16 => 16,
+            Reg::X17 | Reg::W17 => 17,
+            Reg::X18 | Reg::W18 => 18,
+            Reg::X19 | Reg::W19 => 19,
+            Reg::X20 | Reg::W20 => 20,
+            Reg::X21 | Reg::W21 => 21,
             Reg::X22 | Reg::W22 => 22,
+            Reg::X23 | Reg::W23 => 23,
+            Reg::X24 | Reg::W24 => 24,
+            Reg::X25 | Reg::W25 => 25,
+            Reg::X26 | Reg::W26 => 26,
+            Reg::X27 | Reg::W27 => 27,
             Reg::X28 | Reg::W28 => 28,
             Reg::X29 | Reg::W29 => 29,
             Reg::X30 | Reg::W30 => 30,
@@ -1886,7 +1980,24 @@ impl Reg {
             8 => Reg::X8,
             9 => Reg::X9,
             10 => Reg::X10,
+            11 => Reg::X11,
+            12 => Reg::X12,
+            13 => Reg::X13,
+            14 => Reg::X14,
+            15 => Reg::X15,
+            16 => Reg::X16,
+            17 => Reg::X17,
+            18 => Reg::X18,
+            19 => Reg::X19,
+            20 => Reg::X20,
+            21 => Reg::X21,
             22 => Reg::X22,
+            23 => Reg::X23,
+            24 => Reg::X24,
+            25 => Reg::X25,
+            26 => Reg::X26,
+            27 => Reg::X27,
+            28 => Reg::X28,
             29 => Reg::X29,
             30 => Reg::X30,
             _ => panic!("Invalid index for 64-bit register"),
@@ -1906,6 +2017,24 @@ impl Reg {
             8 => Reg::W8,
             9 => Reg::W9,
             10 => Reg::W10,
+            11 => Reg::W11,
+            12 => Reg::W12,
+            13 => Reg::W13,
+            14 => Reg::W14,
+            15 => Reg::W15,
+            16 => Reg::W16,
+            17 => Reg::W17,
+            18 => Reg::W18,
+            19 => Reg::W19,
+            20 => Reg::W20,
+            21 => Reg::W21,
+            22 => Reg::W22,
+            23 => Reg::W23,
+            24 => Reg::W24,
+            25 => Reg::W25,
+            26 => Reg::W26,
+            27 => Reg::W27,
+            28 => Reg::W28,
             29 => Reg::W29,
             30 => Reg::W30,
             _ => panic!("Invalid index for 32-bit register"),
@@ -1926,7 +2055,22 @@ impl Reg {
             Reg::X9 | Reg::W9 => 9,
             Reg::X10 | Reg::W10 => 10,
             Reg::X11 | Reg::W11 => 11,
+            Reg::X12 | Reg::W12 => 12,
+            Reg::X13 | Reg::W13 => 13,
+            Reg::X14 | Reg::W14 => 14,
+            Reg::X15 | Reg::W15 => 15,
+            Reg::X16 | Reg::W16 => 16,
+            Reg::X17 | Reg::W17 => 17,
+            Reg::X18 | Reg::W18 => 18,
+            Reg::X19 | Reg::W19 => 19,
+            Reg::X20 | Reg::W20 => 20,
+            Reg::X21 | Reg::W21 => 21,
             Reg::X22 | Reg::W22 => 22,
+            Reg::X23 | Reg::W23 => 23,
+            Reg::X24 | Reg::W24 => 24,
+            Reg::X25 | Reg::W25 => 25,
+            Reg::X26 | Reg::W26 => 26,
+            Reg::X27 | Reg::W27 => 27,
             Reg::X28 | Reg::W28 => 28,
             Reg::X29 | Reg::W29 => 29,
             Reg::X30 | Reg::W30 => 30,
@@ -1950,6 +2094,21 @@ impl Reg {
             | Reg::X9
             | Reg::X10
             | Reg::X11
+            | Reg::X12
+            | Reg::X13
+            | Reg::X14
+            | Reg::X15
+            | Reg::X16
+            | Reg::X17
+            | Reg::X18
+            | Reg::X19
+            | Reg::X20
+            | Reg::X21
+            | Reg::X23
+            | Reg::X24
+            | Reg::X25
+            | Reg::X26
+            | Reg::X27
             | Reg::X28
             | Reg::X29
             | Reg::X30
@@ -1967,7 +2126,22 @@ impl Reg {
             | Reg::W9
             | Reg::W10
             | Reg::W11
+            | Reg::W12
+            | Reg::W13
+            | Reg::W14
+            | Reg::W15
+            | Reg::W16
+            | Reg::W17
+            | Reg::W18
+            | Reg::W19
+            | Reg::W20
+            | Reg::W21
             | Reg::W22
+            | Reg::W23
+            | Reg::W24
+            | Reg::W25
+            | Reg::W26
+            | Reg::W27
             | Reg::W28
             | Reg::W29
             | Reg::WZR
@@ -1991,11 +2165,26 @@ impl Reg {
             | Reg::W9
             | Reg::W10
             | Reg::W11
+            | Reg::W12
+            | Reg::W13
+            | Reg::W14
+            | Reg::W15
+            | Reg::W16
+            | Reg::W17
+            | Reg::W18
+            | Reg::W19
+            | Reg::W20
+            | Reg::W21
             | Reg::W22
+            | Reg::W23
+            | Reg::W24
+            | Reg::W25
+            | Reg::W26
+            | Reg::W27
+            | Reg::W28
             | Reg::W29
             | Reg::W30
             | Reg::WSP
-            | Reg::W28
             | Reg::WZR => true,
             Reg::X0
             | Reg::X1
@@ -2009,12 +2198,44 @@ impl Reg {
             | Reg::X9
             | Reg::X10
             | Reg::X11
+            | Reg::X12
+            | Reg::X13
+            | Reg::X14
+            | Reg::X15
+            | Reg::X16
+            | Reg::X17
+            | Reg::X18
+            | Reg::X19
+            | Reg::X20
+            | Reg::X21
             | Reg::X22
+            | Reg::X23
+            | Reg::X24
+            | Reg::X25
+            | Reg::X26
+            | Reg::X27
             | Reg::X28
             | Reg::X29
             | Reg::X30
             | Reg::SP
             | Reg::XZR => false,
+        }
+    }
+
+    pub fn as_64bit(&self) -> Self {
+        if (*self as u8) < (Self::W0 as u8) {
+            return *self;
+        }
+
+        if (*self as u8) <= (Self::W30 as u8) {
+            let integer_value = (*self as u8) - (Self::W0 as u8);
+            return unsafe { std::mem::transmute::<u8, Self>(integer_value) };
+        }
+
+        match self {
+            Reg::XZR | Reg::WZR => Reg::XZR,
+            Reg::SP | Reg::WSP => Reg::SP,
+            _ => unreachable!(),
         }
     }
 
@@ -2032,7 +2253,22 @@ impl Reg {
             Reg::X9 | Reg::W9 => Reg::W9,
             Reg::X10 | Reg::W10 => Reg::W10,
             Reg::X11 | Reg::W11 => Reg::W11,
+            Reg::X12 | Reg::W12 => Reg::W12,
+            Reg::X13 | Reg::W13 => Reg::W13,
+            Reg::X14 | Reg::W14 => Reg::W14,
+            Reg::X15 | Reg::W15 => Reg::W15,
+            Reg::X16 | Reg::W16 => Reg::W16,
+            Reg::X17 | Reg::W17 => Reg::W17,
+            Reg::X18 | Reg::W18 => Reg::W18,
+            Reg::X19 | Reg::W19 => Reg::W19,
+            Reg::X20 | Reg::W20 => Reg::W20,
+            Reg::X21 | Reg::W21 => Reg::W21,
             Reg::X22 | Reg::W22 => Reg::W22,
+            Reg::X23 | Reg::W23 => Reg::W23,
+            Reg::X24 | Reg::W24 => Reg::W24,
+            Reg::X25 | Reg::W25 => Reg::W25,
+            Reg::X26 | Reg::W26 => Reg::W26,
+            Reg::X27 | Reg::W27 => Reg::W27,
             Reg::X28 | Reg::W28 => Reg::W28,
             Reg::X29 | Reg::W29 => Reg::W29,
             Reg::XZR | Reg::WZR => Reg::WZR,
@@ -2055,7 +2291,22 @@ impl Reg {
             Reg::X9 => "x9",
             Reg::X10 => "x10",
             Reg::X11 => "x11",
+            Reg::X12 => "x12",
+            Reg::X13 => "x13",
+            Reg::X14 => "x14",
+            Reg::X15 => "x15",
+            Reg::X16 => "x16",
+            Reg::X17 => "x17",
+            Reg::X18 => "x18",
+            Reg::X19 => "x19",
+            Reg::X20 => "x20",
+            Reg::X21 => "x21",
             Reg::X22 => "x22",
+            Reg::X23 => "x23",
+            Reg::X24 => "x24",
+            Reg::X25 => "x25",
+            Reg::X26 => "x26",
+            Reg::X27 => "x27",
             Reg::X28 => "x28",
             Reg::X29 => "x29",
             Reg::X30 => "x30",
@@ -2071,7 +2322,22 @@ impl Reg {
             Reg::W9 => "w9",
             Reg::W10 => "w10",
             Reg::W11 => "w11",
+            Reg::W12 => "w12",
+            Reg::W13 => "w13",
+            Reg::W14 => "w14",
+            Reg::W15 => "w15",
+            Reg::W16 => "w16",
+            Reg::W17 => "w17",
+            Reg::W18 => "w18",
+            Reg::W19 => "w19",
+            Reg::W20 => "w20",
+            Reg::W21 => "w21",
             Reg::W22 => "w22",
+            Reg::W23 => "w23",
+            Reg::W24 => "w24",
+            Reg::W25 => "w25",
+            Reg::W26 => "w26",
+            Reg::W27 => "w27",
             Reg::W28 => "w28",
             Reg::W29 => "w29",
             Reg::W30 => "w30",
@@ -2111,6 +2377,37 @@ mod test {
     use std::u32;
 
     use super::*;
+
+    #[test]
+    fn test_assembler_registers() {
+        use Reg::*;
+
+        for reg in Reg::iter_all().filter(|reg| match reg {
+            Reg::XZR | Reg::WZR | Reg::SP | Reg::WSP => false,
+            _ => true,
+        }) {
+            let is_ret = reg == X0 || reg == W0;
+            let mut assembler = Assembler::new();
+            if !is_ret {
+                assembler.mov(X1, reg.as_64bit());
+            }
+            println!("reg: {:?}", reg);
+            assembler.mov_imm(reg, 420.into());
+            if !is_ret {
+                assembler.mov(X0, reg.as_64bit());
+            }
+            if !is_ret {
+                assembler.mov(reg.as_64bit(), X1);
+            }
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func =
+                unsafe { std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(exec.addr) };
+            assert_eq!(func(), 420);
+        }
+    }
 
     #[test]
     fn test_assembler_subs_ext_reg() {
@@ -2305,8 +2602,8 @@ mod test {
         {
             let mut asm = Assembler::new();
             // Start at X0 + 16 (passed as pointer to input[2])
-            asm.ldr_imm_pre_index(X1, X0, (-8).into());  // Decrement by 8, load from input[1]
-            asm.ldr_imm_pre_index(X2, X0, (-8).into());  // Decrement by 8 again, load from input[0]
+            asm.ldr_imm_pre_index(X1, X0, (-8).into()); // Decrement by 8, load from input[1]
+            asm.ldr_imm_pre_index(X2, X0, (-8).into()); // Decrement by 8 again, load from input[0]
             asm.add(X0, X1, X2);
             asm.ret();
 
