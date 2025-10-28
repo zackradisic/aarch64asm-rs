@@ -25,38 +25,155 @@ extern "C" {
     fn pthread_jit_write_protect_np(enabled: c_int) -> c_void;
 }
 
+#[derive(Debug)]
 pub struct ExecutableMem {
-    addr: *mut c_void,
-    len: usize,
+    pub addr: *mut u8,
+    pub len: usize,
+}
+
+impl Default for ExecutableMem {
+    fn default() -> Self {
+        ExecutableMem::empty()
+    }
 }
 
 impl ExecutableMem {
     pub unsafe fn as_fn<F>(&self) -> F {
         std::mem::transmute_copy(&self.addr)
     }
+
+    pub fn empty() -> Self {
+        Self {
+            addr: std::ptr::null_mut(),
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn from_bytes_copy(bytes: &[u8]) -> Self {
+        ExecutableMem::init_with_fn(
+            bytes.len(),
+            Some(|addr| {
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr, bytes.len()) };
+            }),
+        )
+    }
+
+    pub fn capacity(capacity: usize) -> Self {
+        ExecutableMem::init_with_fn(capacity, None::<fn(*mut u8)>)
+    }
+
+    pub fn write_protect(enable: bool) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            pthread_jit_write_protect_np(if enable { 1 } else { 0 });
+        }
+    }
+
+    pub fn init_with_fn(capacity: usize, init_fn: Option<impl FnOnce(*mut u8)>) -> Self {
+        assert_ne!(capacity, 0, "Capacity must be greater than 0");
+        assert!(capacity & 0b11 == 0, "Capacity must be >= 4 bytes");
+
+        // TODO: handle error
         // 7 = PROT_READ | PROT_WRITE | PROT_EXEC
         // 6146 = MAP_PRIVATE | MAP_ANON | MAP_JIT
-        let addr = unsafe { mmap(std::ptr::null_mut(), bytes.len(), 7, 6146, -1, 0) };
-        #[cfg(target_os = "macos")]
-        unsafe {
-            pthread_jit_write_protect_np(0)
-        };
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
-        #[cfg(target_os = "macos")]
-        unsafe {
-            pthread_jit_write_protect_np(1)
-        };
-        Self {
-            addr,
-            len: bytes.len(),
+        let addr = unsafe { mmap(std::ptr::null_mut(), capacity, 7, 6146, -1, 0) };
+        if let Some(init_fn) = init_fn {
+            Self::write_protect(false);
+            init_fn(addr as *mut u8);
+            Self::write_protect(true);
         }
+        Self {
+            addr: addr as *mut u8,
+            len: capacity,
+        }
+    }
+
+    /// Construct a writer to this executable memory region. On macOS, this will
+    /// disable write protection for the duration of the writer's lifetime.
+    pub fn as_writer<'a>(&'a mut self) -> ExecutableMemWriter<'a> {
+        Self::write_protect(false);
+        ExecutableMemWriter::new(self)
     }
 }
 
 impl Drop for ExecutableMem {
     fn drop(&mut self) {
         unsafe { munmap(self.addr as *mut c_void, self.len) };
+    }
+}
+
+pub struct ExecutableMemWriter<'a> {
+    mem: &'a mut ExecutableMem,
+    len: usize,
+}
+
+impl<'a> ExecutableMemWriter<'a> {
+    pub fn new(mem: &'a mut ExecutableMem) -> Self {
+        if mem.len & 0b11 != 0 {
+            panic!("ExecutableMem must be 4 byte aligned");
+        }
+        Self { mem, len: 0 }
+    }
+
+    pub fn cap(&self) -> usize {
+        self.mem.len / 4
+    }
+}
+
+impl<'a> Write for ExecutableMemWriter<'a> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.len + buf.len() > self.cap() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "ExecutableMemWriter is full",
+            ));
+        }
+
+        let buf_range = buf.as_ptr_range();
+        let executable_range = unsafe {
+            self.mem.addr.add(self.len).cast_const()
+                ..self.mem.addr.add(self.len + buf.len()).cast_const()
+        };
+
+        let overlaps = {
+            let mut a = buf_range;
+            let mut b = executable_range;
+            if b.start < a.start {
+                std::mem::swap(&mut a, &mut b);
+            }
+            b.start < a.end
+        };
+
+        unsafe {
+            let slice = std::slice::from_raw_parts_mut(self.mem.addr.add(self.len), buf.len());
+
+            if overlaps {
+                std::ptr::copy(buf.as_ptr(), slice.as_mut_ptr(), buf.len());
+            } else {
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), slice.as_mut_ptr(), buf.len());
+            }
+        }
+
+        self.len += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> Drop for ExecutableMemWriter<'a> {
+    fn drop(&mut self) {
+        ExecutableMem::write_protect(true);
     }
 }
 
@@ -73,8 +190,9 @@ pub enum CC {
     Hi = 0b1000,
     // unsigned higher or same
     Hs = 0b0010,
-    // unsigned lower
+    // unsigned lower or same
     Ls = 0b1001,
+    // unsigned lower
     Lo = 0b0011,
 }
 
@@ -282,6 +400,7 @@ impl ShiftKind {
 pub enum Instr {
     Adr(Reg, Label),
     Br(Reg),
+    Blr(Reg),
 
     Cset(Reg, CC),
 
@@ -312,6 +431,7 @@ pub enum Instr {
     Ldr32ImmPostIndex(Reg, Reg, Imm),
     Ldr64ImmPostIndex(Reg, Reg, Imm),
 
+    // LslImm(Reg, Reg, Imm),
     Orr(Reg, Reg, Imm),
 
     AddShift(Reg, Reg, Reg, ShiftKind, Imm),
@@ -353,6 +473,8 @@ const CBNZ_64: u32 = 0b10110101_0000000000000000000_00000;
 const B: u32 = 0b000101_00000000000000000000000000;
 const BR: u32 = 0b1101011000011111000000_00000_00000;
 const B_COND: u32 = 0b01010100_0000000000000000000_0_0000;
+/// https://developer.arm.com/documentation/ddi0602/2025-03/Base-Instructions/BLR--Branch-with-link-to-register-?lang=en
+const BLR: u32 = 0b1101011000111111000000_00000_00000;
 
 /// https://developer.arm.com/documentation/ddi0602/2021-12/Base-Instructions/LDR--register---Load-Register--register--?lang=en
 const LDR_32: u32 = 0b10111000011_00000_000_0_10_00000_00000;
@@ -447,6 +569,10 @@ const MOVK_IMM_64: u32 = 0b111100101_00_0000000000000000_00000;
 const MOVZ_IMM_32: u32 = 0b010100101_00_0000000000000000_00000;
 const MOVZ_IMM_64: u32 = 0b110100101_00_0000000000000000_00000;
 
+/// https://developer.arm.com/documentation/ddi0602/2025-03/Base-Instructions/LSL--immediate---Logical-shift-left--immediate---an-alias-of-UBFM-?lang=en
+const LSL_IMM_32: u32 = 0b0_10100110_0_000000_000000_00000_00000;
+const LSL_IMM_64: u32 = 0b1_10100110_0_000000_000000_00000_00000;
+
 pub struct Assembler {
     pub used_registers: Vec<Reg>,
     pub instrs: Vec<Instr>,
@@ -530,7 +656,7 @@ impl Assembler {
                     }
                 }
                 Instr::JumpAddr(_) => {}
-                Instr::Br(r) => {}
+                Instr::Br(r) | Instr::Blr(r) => {}
                 Instr::Adr(_, l) => {
                     // TODO: Can we omit this? It owuld
                 }
@@ -554,6 +680,7 @@ impl Assembler {
                 Instr::LdrbImmPostIndex(reg, reg1, imm) => {}
                 Instr::Ldr32ImmPostIndex(reg, reg1, imm) => {}
                 Instr::Ldr64ImmPostIndex(reg, reg1, imm) => {}
+                // Instr::LslImm(reg, imm, _) => {}
                 Instr::AddShift(reg, reg1, reg2, shift_kind, imm) => {}
                 Instr::AddImm(reg, reg1, imm, _) => {}
                 Instr::Subs(reg, reg1, reg2) => {}
@@ -618,9 +745,18 @@ impl Assembler {
         self.instrs.push(Instr::Cb(false, reg, label));
     }
 
+    /// This is an alias for `subs xzr, left, right`
+    ///
+    /// https://developer.arm.com/documentation/ddi0602/2025-03/Base-Instructions/CMP--extended-register---Compare--extended-register---an-alias-of-SUBS--extended-register--?lang=en
     pub fn cmp(&mut self, left: Reg, right: Reg) {
-        // self.instrs.push(Instr::Cmp(left, right));
+        assert_ne!(right, Reg::SP);
         let zero_reg = if left.is_64bit() { Reg::XZR } else { Reg::WZR };
+        // SP is allowed as the left operand but only with the extended register
+        // form of subs
+        if left == Reg::SP {
+            self.subs_ext_reg(zero_reg, left, right);
+            return;
+        }
         self.instrs.push(Instr::Subs(zero_reg, left, right));
     }
 
@@ -665,6 +801,13 @@ impl Assembler {
 
         let zero_reg = if out.is_64bit() { Reg::XZR } else { Reg::WZR };
         self.instrs.push(Instr::Madd(out, a, b, zero_reg));
+    }
+
+    pub fn madd(&mut self, out: Reg, a: Reg, b: Reg, c: Reg) {
+        assert_eq!(out.is_64bit(), a.is_64bit());
+        assert_eq!(a.is_64bit(), b.is_64bit());
+        assert_eq!(b.is_64bit(), c.is_64bit());
+        self.instrs.push(Instr::Madd(out, a, b, c));
     }
 
     pub fn add(&mut self, out: Reg, a: Reg, b: Reg) {
@@ -842,12 +985,25 @@ impl Assembler {
         self.instrs.push(Instr::JumpAddr(addr));
     }
 
+    pub fn br(&mut self, reg: Reg) {
+        self.branch_register(reg);
+    }
+
     pub fn branch_register(&mut self, reg: Reg) {
         self.instrs.push(Instr::Br(reg));
     }
 
+    pub fn b(&mut self, cc: CC, label: Label) {
+        self.branch(cc, label);
+    }
+
     pub fn branch(&mut self, cc: CC, label: Label) {
         self.instrs.push(Instr::Branch(cc, label));
+    }
+
+    pub fn blr(&mut self, reg: Reg) {
+        assert!(reg.is_64bit());
+        self.instrs.push(Instr::Blr(reg));
     }
 
     pub fn imm_needs_mov(&self, imm: Imm) -> bool {
@@ -939,16 +1095,21 @@ impl Assembler {
     }
 
     pub fn emit(&mut self) -> Vec<u8> {
+        let mut outbuf = vec![];
+        self.emit_with_writer(&mut outbuf).unwrap();
+        outbuf
+    }
+
+    pub fn emit_with_writer(&mut self, mut outbuf: impl Write) -> std::io::Result<()> {
         for (label, idx) in self.labels.iter() {
             if *idx == usize::MAX {
                 panic!("Label not patched: {}", label);
             }
         }
-        let mut outbuf = vec![];
         for (idx, instr) in self.instrs.iter().enumerate() {
             self.emit_binary(instr, idx, &mut outbuf).unwrap();
         }
-        outbuf
+        Ok(())
     }
 
     pub fn as_asm(&self) -> String {
@@ -976,6 +1137,13 @@ impl Assembler {
         mut outbuf: impl Write,
     ) -> std::io::Result<()> {
         match instr {
+            Instr::Blr(reg) => {
+                assert!(reg.is_64bit());
+                let mut instr_bits = BLR;
+                instr_bits.set_bit_range(9, 5, reg.as_bits());
+                outbuf.write_all(&instr_bits.to_le_bytes())?;
+                Ok(())
+            }
             Instr::Br(reg) => {
                 assert!(reg.is_64bit());
 
@@ -1138,6 +1306,31 @@ impl Assembler {
 
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
+            // Instr::LslImm(out, a, shift) => {
+            //     assert_eq!(out.is_64bit(), a.is_64bit());
+            //     let is_32_bit = out.is_32bit();
+            //     let shift = shift.as_usize();
+            //     if is_32_bit {
+            //         assert!(shift <= 31);
+            //     } else {
+            //         assert!(shift <= 63);
+            //     }
+            //     let shift = shift as i64;
+            //     let immr = (-shift % if is_32_bit { 32 } else { 64 }) as u32;
+            //     let imms = if is_32_bit {
+            //         63 - shift as u32
+            //     } else {
+            //         31 - shift as u32
+            //     };
+
+            //     let mut instrbits = if is_32_bit { LSL_IMM_32 } else { LSL_IMM_64 };
+            //     instrbits.set_bit_range(4, 0, out.as_bits());
+            //     instrbits.set_bit_range(9, 5, a.as_bits());
+            //     instrbits.set_bit_range(21, 16, immr);
+            //     instrbits.set_bit_range(15, 10, imms);
+
+            //     outbuf.write_all(&instrbits.to_le_bytes())
+            // }
             Instr::LdpPostIndex(a, b, dest, imm) => {
                 assert_eq!(a.is_64bit(), b.is_64bit());
                 assert!(dest.is_64bit());
@@ -1559,6 +1752,9 @@ impl Assembler {
                 instrbits.set_bit_range(20, 5, val as u32);
                 instrbits.set_bit_range(22, 21, 0);
 
+                let val: u32 = u32::from_le_bytes(instrbits.to_le_bytes());
+                println!("MOV_IMM: {:?}", val);
+
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
             Instr::MovzImm(reg, imm, hw) => {
@@ -1602,6 +1798,8 @@ impl Assembler {
             Instr::Ret => {
                 let mut instrbits: u32 = 0b1101011001011111000000_00000_00000;
                 instrbits.set_bit_range(9, 5, 30);
+                let val: u32 = u32::from_le_bytes(instrbits.to_le_bytes());
+                println!("RET: {:?}", val);
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
         }
@@ -1651,6 +1849,9 @@ impl Instr {
                     reg1.as_asm(),
                     imm.as_isize()
                 )
+            }
+            Instr::Blr(reg) => {
+                format!("blr\t{}", reg.as_asm())
             }
             Instr::Br(reg) => {
                 format!("br\t{}", reg.as_asm())
@@ -2403,8 +2604,7 @@ mod test {
 
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func =
-                unsafe { std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(exec.addr) };
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn() -> usize>(exec.addr) };
             assert_eq!(func(), 420);
         }
     }
@@ -2436,8 +2636,7 @@ mod test {
         asm.ret();
 
         let exec = ExecutableMem::from_bytes_copy(&asm.emit());
-        let func =
-            unsafe { std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(exec.addr) };
+        let func = unsafe { std::mem::transmute::<_, extern "C" fn() -> usize>(exec.addr) };
 
         assert_eq!(func(), 35);
     }
@@ -2455,8 +2654,7 @@ mod test {
             asm.ret();
 
             let exec = ExecutableMem::from_bytes_copy(&asm.emit());
-            let func =
-                unsafe { std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(exec.addr) };
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn() -> usize>(exec.addr) };
             std::io::stdout().flush().unwrap();
             assert_eq!(func(), 0);
         }
@@ -2470,8 +2668,7 @@ mod test {
             asm.ret();
 
             let exec = ExecutableMem::from_bytes_copy(&asm.emit());
-            let func =
-                unsafe { std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(exec.addr) };
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn() -> usize>(exec.addr) };
             std::io::stdout().flush().unwrap();
             assert_eq!(func(), 0);
         }
@@ -2490,8 +2687,7 @@ mod test {
 
         println!("{}", asm.as_asm());
         let exec = ExecutableMem::from_bytes_copy(&asm.emit());
-        let func =
-            unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr) };
+        let func = unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
 
         assert_eq!(func(420), 420);
     }
@@ -2507,8 +2703,7 @@ mod test {
 
         println!("{}", asm.as_asm());
         let exec = ExecutableMem::from_bytes_copy(&asm.emit());
-        let func =
-            unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr) };
+        let func = unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
 
         assert_eq!(func(420), 420);
     }
@@ -2525,9 +2720,8 @@ mod test {
             asm.ldp_imm_post_index(X29, X30, SP, Imm::I16(16));
             asm.ret();
             let exec = ExecutableMem::from_bytes_copy(&asm.emit());
-            let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr)
-            };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
             assert_eq!(func(420), 420);
         }
 
@@ -2541,9 +2735,8 @@ mod test {
             asm.ldp_imm_post_index(X29, X30, SP, Imm::I16(16));
             asm.ret();
             let exec = ExecutableMem::from_bytes_copy(&asm.emit());
-            let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr)
-            };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
             assert_eq!(func(420), 420);
             assert_eq!(func(69), 69);
         }
@@ -2564,7 +2757,7 @@ mod test {
 
             let exec = ExecutableMem::from_bytes_copy(&asm.emit());
             let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(*const usize) -> usize>(exec.addr)
+                std::mem::transmute::<_, extern "C" fn(*const usize) -> usize>(exec.addr)
             };
 
             let input: [usize; 2] = [0; 2];
@@ -2590,7 +2783,7 @@ mod test {
 
             let exec = ExecutableMem::from_bytes_copy(&asm.emit());
             let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(*const usize) -> usize>(exec.addr)
+                std::mem::transmute::<_, extern "C" fn(*const usize) -> usize>(exec.addr)
             };
 
             let input: [usize; 3] = [0, 34, 35];
@@ -2609,7 +2802,7 @@ mod test {
 
             let exec = ExecutableMem::from_bytes_copy(&asm.emit());
             let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(*const usize) -> usize>(exec.addr)
+                std::mem::transmute::<_, extern "C" fn(*const usize) -> usize>(exec.addr)
             };
 
             let input: [usize; 3] = [10, 20, 30];
@@ -2628,9 +2821,7 @@ mod test {
 
             let exec = ExecutableMem::from_bytes_copy(&asm.emit());
             let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(*mut u8, usize, usize) -> usize>(
-                    exec.addr,
-                )
+                std::mem::transmute::<_, extern "C" fn(*mut u8, usize, usize) -> usize>(exec.addr)
             };
 
             let mut input: [u8; 24] = *b"XXXXXXXX1234567812345678";
@@ -2648,9 +2839,7 @@ mod test {
 
             let exec = ExecutableMem::from_bytes_copy(&asm.emit());
             let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(*mut u8, usize, usize) -> usize>(
-                    exec.addr,
-                )
+                std::mem::transmute::<_, extern "C" fn(*mut u8, usize, usize) -> usize>(exec.addr)
             };
 
             let mut input: [u8; 24] = *b"XXXXXXXX1234567812345678";
@@ -2672,9 +2861,7 @@ mod test {
 
         let exec = ExecutableMem::from_bytes_copy(&asm.emit());
         let func = unsafe {
-            std::mem::transmute::<*mut c_void, extern "C" fn(*mut usize, usize, usize) -> usize>(
-                exec.addr,
-            )
+            std::mem::transmute::<_, extern "C" fn(*mut usize, usize, usize) -> usize>(exec.addr)
         };
 
         let mut input: [usize; 8] = [0; 8];
@@ -2702,9 +2889,8 @@ mod test {
         asm.ret();
 
         let exec = ExecutableMem::from_bytes_copy(&asm.emit());
-        let func = unsafe {
-            std::mem::transmute::<*mut c_void, extern "C" fn(usize, usize) -> usize>(exec.addr)
-        };
+        let func =
+            unsafe { std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr) };
         assert_eq!(func(34, 35), 35);
         let foo = black_box("nice");
         println!("{:?}", foo);
@@ -2725,9 +2911,8 @@ mod test {
             asm.ret();
 
             let exec = ExecutableMem::from_bytes_copy(&asm.emit());
-            let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr)
-            };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
             assert_eq!(func(0), 420);
         }
 
@@ -2749,7 +2934,7 @@ mod test {
 
             let exec = ExecutableMem::from_bytes_copy(&asm.emit());
             let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize, usize) -> usize>(exec.addr)
+                std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr)
             };
 
             assert_eq!(func(10, 5), 5);
@@ -2764,8 +2949,7 @@ mod test {
         assembler.ret();
         let bytes = assembler.emit();
         let exec = ExecutableMem::from_bytes_copy(&bytes);
-        let func =
-            unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> u32>(exec.addr) };
+        let func = unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> u32>(exec.addr) };
 
         assert_eq!(func(0), 1);
         assert_eq!(func(1), 0);
@@ -2779,8 +2963,7 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func =
-                unsafe { std::mem::transmute::<*mut c_void, extern "C" fn() -> u32>(exec.addr) };
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn() -> u32>(exec.addr) };
             assert_eq!(func(), 4206900);
         }
 
@@ -2790,8 +2973,7 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func =
-                unsafe { std::mem::transmute::<*mut c_void, extern "C" fn() -> u32>(exec.addr) };
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn() -> u32>(exec.addr) };
             assert_eq!(func(), 420);
         }
     }
@@ -2805,8 +2987,7 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func =
-                unsafe { std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(exec.addr) };
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn() -> usize>(exec.addr) };
             assert_eq!(func(), value);
         }
 
@@ -2816,8 +2997,7 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func =
-                unsafe { std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(exec.addr) };
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn() -> usize>(exec.addr) };
             assert_eq!(func(), 420);
         }
     }
@@ -2834,8 +3014,7 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func =
-                unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(u32) -> u32>(exec.addr) };
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn(u32) -> u32>(exec.addr) };
             assert_eq!(func(0), 69);
             assert_eq!(func(1), 1);
             assert_eq!(func(2), 2);
@@ -2851,9 +3030,8 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr)
-            };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
             assert_eq!(func(0), 69);
             assert_eq!(func(1), 1);
             assert_eq!(func(2), 2);
@@ -2875,7 +3053,7 @@ mod test {
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
             let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize, usize) -> usize>(exec.addr)
+                std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr)
             };
             assert_eq!(func(0, 0), 420);
             assert_eq!(func(1, 1), 420);
@@ -2895,9 +3073,8 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(u32, u32) -> u32>(exec.addr)
-            };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(u32, u32) -> u32>(exec.addr) };
             assert_eq!(func(0, 0), 420);
             assert_eq!(func(1, 1), 420);
             assert_eq!(func(2, 2), 420);
@@ -2921,8 +3098,9 @@ mod test {
 
         let bytes = assembler.emit();
         let exec = ExecutableMem::from_bytes_copy(&bytes);
-        let func: extern "C" fn(*const u8, *mut usize) -> usize =
-            unsafe { std::mem::transmute::<*mut c_void, _>(exec.addr) };
+        let func: extern "C" fn(*const u8, *mut usize) -> usize = unsafe {
+            std::mem::transmute::<_, extern "C" fn(*const u8, *mut usize) -> usize>(exec.addr)
+        };
 
         let mut output: usize = 0;
         assert_eq!(func(input.as_ptr(), &mut output), result as usize);
@@ -2945,8 +3123,8 @@ mod test {
 
         let bytes = assembler.emit();
         let exec = ExecutableMem::from_bytes_copy(&bytes);
-        let func =
-            unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(*mut u8) -> u32>(exec.addr) };
+        let func: extern "C" fn(*mut u8) -> u32 =
+            unsafe { std::mem::transmute::<_, extern "C" fn(*mut u8) -> u32>(exec.addr) };
 
         let mut input = vec![0; 5];
         func(input.as_mut_ptr());
@@ -2974,9 +3152,7 @@ mod test {
         let bytes = assembler.emit();
         let exec = ExecutableMem::from_bytes_copy(&bytes);
         let func = unsafe {
-            std::mem::transmute::<*mut c_void, extern "C" fn(*const u8, *mut u8, usize) -> u32>(
-                exec.addr,
-            )
+            std::mem::transmute::<_, extern "C" fn(*const u8, *mut u8, usize) -> u32>(exec.addr)
         };
 
         let input = b"HELLO";
@@ -3005,7 +3181,7 @@ mod test {
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
             let func: extern "C" fn(*const u8) -> usize =
-                unsafe { std::mem::transmute::<*mut c_void, _>(exec.addr) };
+                unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> usize>(exec.addr) };
 
             assert_eq!(func(input.as_ptr()), 1);
             assert_eq!(func(b"01234".as_ptr()), 0);
@@ -3023,7 +3199,7 @@ mod test {
         let bytes = assembler.emit();
         let exec = ExecutableMem::from_bytes_copy(&bytes);
         let func: extern "C" fn(*const u8) -> usize =
-            unsafe { std::mem::transmute::<*mut c_void, _>(exec.addr) };
+            unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> usize>(exec.addr) };
 
         let input = b"00000000LOLMAO!!";
         let result = usize::from_le_bytes(input[8..].try_into().unwrap());
@@ -3040,7 +3216,7 @@ mod test {
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
             let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize, usize) -> usize>(exec.addr)
+                std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr)
             };
             assert_eq!(func(0, 0), 0);
             assert_eq!(func(1, 1), 2);
@@ -3055,7 +3231,7 @@ mod test {
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
             let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize, usize) -> usize>(exec.addr)
+                std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr)
             };
             assert_eq!(func(0, 0), 0);
             assert_eq!(func(0, 1), 1);
@@ -3070,9 +3246,8 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr)
-            };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
             assert_eq!(func(0), 0);
         }
     }
@@ -3087,7 +3262,7 @@ mod test {
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
             let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize, usize) -> usize>(exec.addr)
+                std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr)
             };
             assert_eq!(func(0, 0), 0);
             assert_eq!(func(1, 1), 0);
@@ -3102,7 +3277,7 @@ mod test {
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
             let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize, usize) -> usize>(exec.addr)
+                std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr)
             };
             assert_eq!(func(0, 0), 0);
             assert_eq!(func(0, 1), 1);
@@ -3117,9 +3292,8 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr)
-            };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
             assert_eq!(func(0), 0);
         }
     }
@@ -3133,9 +3307,8 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(isize) -> isize>(exec.addr)
-            };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(isize) -> isize>(exec.addr) };
             assert_eq!(func(0), -1);
             assert_eq!(func(1), 0);
             assert_eq!(func(2), 1);
@@ -3167,9 +3340,8 @@ mod test {
 
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr)
-            };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
 
             assert_eq!(func(0), 0);
             assert_eq!(func(1), 1);
@@ -3194,8 +3366,7 @@ mod test {
 
         let bytes = assembler.emit();
         let exec = ExecutableMem::from_bytes_copy(&bytes);
-        let func =
-            unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr) };
+        let func = unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
 
         // print!("RUNNIN!");
         assert_eq!(func(1), 1);
@@ -3220,9 +3391,8 @@ mod test {
 
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr)
-            };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
 
             assert_eq!(func(0), 69);
             assert_eq!(func(1), 69);
@@ -3244,9 +3414,8 @@ mod test {
 
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe {
-                std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr)
-            };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
 
             assert_ne!(func(4), 69);
             assert_eq!(func(5), 69);
@@ -3291,8 +3460,7 @@ mod test {
 
         let bytes = assembler.emit();
         let exec = ExecutableMem::from_bytes_copy(&bytes);
-        let func =
-            unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> usize>(exec.addr) };
+        let func = unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
 
         fn expected_fib(n: isize) -> usize {
             if n < 2 {
