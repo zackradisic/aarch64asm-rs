@@ -422,6 +422,7 @@ pub enum Instr {
     LdpPostIndex(Reg, Reg, Reg, Imm),
 
     Ldr(Reg, Reg, Reg),
+    LdrShift(Reg, Reg, Reg),
     LdrImmPostIndex(Reg, Reg, Imm),
     LdrImmPreIndex(Reg, Reg, Imm),
     LdrhImmPostIndex(Reg, Reg, Imm),
@@ -673,6 +674,7 @@ impl Assembler {
                 Instr::Str(reg, reg1, reg2) => {}
                 Instr::StrbPostIndex(reg, reg1, imm) => {}
                 Instr::Ldr(reg, reg1, reg2) => {}
+                Instr::LdrShift(reg, reg1, reg2) => {}
                 Instr::LdrImmPostIndex(reg, reg1, imm) => {}
                 Instr::LdrImmPreIndex(reg, reg1, imm) => {}
                 Instr::LdrhImmPostIndex(reg, reg1, imm) => {}
@@ -764,6 +766,15 @@ impl Assembler {
         self.instrs.push(Instr::Ldr(out, base, offset));
     }
 
+    /// For 32-bit, shifts the offset by 2 bits
+    /// For 64-bit, shifts the offset by 3 bits
+    pub fn ldr_shift(&mut self, out: Reg, base: Reg, offset: Reg) {
+        assert_ne!(out, Reg::SP);
+        assert_ne!(offset, Reg::SP);
+        assert!(base.is_64bit());
+        self.instrs.push(Instr::LdrShift(out, base, offset));
+    }
+
     pub fn ldr_imm_post_index(&mut self, out: Reg, base: Reg, offset: Imm) {
         assert!(offset.as_isize() < 256);
         assert!(offset.as_isize() >= -256);
@@ -816,6 +827,14 @@ impl Assembler {
 
         self.instrs
             .push(Instr::AddShift(out, a, b, ShiftKind::Lsl, Imm::U32(0)));
+    }
+
+    pub fn add_shift(&mut self, out: Reg, a: Reg, b: Reg, shift: ShiftKind, imm: Imm) {
+        assert_eq!(out.is_32bit(), a.is_32bit());
+        assert_eq!(a.is_32bit(), b.is_32bit());
+
+        self.instrs
+            .push(Instr::AddShift(out, a, b, ShiftKind::Lsl, imm));
     }
 
     pub fn add_imm(&mut self, out: Reg, a: Reg, b: Imm) {
@@ -1519,6 +1538,20 @@ impl Assembler {
 
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
+            Instr::LdrShift(out, base, offset) => {
+                assert!(base.is_64bit());
+
+                let mut instrbits = if out.is_64bit() { LDR_64 } else { LDR_32 };
+
+                instrbits.set_bit_range(4, 0, out.as_bits());
+                instrbits.set_bit_range(9, 5, base.as_bits());
+                instrbits.set_bit_range(20, 16, offset.as_bits());
+                instrbits.set_bit_range(12, 12, 0b1);
+                let option = if out.is_64bit() { 0b011 } else { 0b011 };
+                instrbits.set_bit_range(15, 13, option);
+
+                outbuf.write_all(&instrbits.to_le_bytes())
+            }
             Instr::Ldrb(out, base, offset) => {
                 todo!()
             }
@@ -1948,6 +1981,16 @@ impl Instr {
                     out.as_asm(),
                     base.as_asm(),
                     offset.as_asm()
+                )
+            }
+            Instr::LdrShift(out, base, offset) => {
+                let shift = if out.is_64bit() { 3 } else { 2 };
+                format!(
+                    "ldr\t{}, [{}, {}, lsl #{}]",
+                    out.as_asm(),
+                    base.as_asm(),
+                    offset.as_asm(),
+                    shift
                 )
             }
             Instr::Ldrb(out, base, offset) => {
@@ -2897,6 +2940,44 @@ mod test {
     }
 
     #[test]
+    fn test_assembler_ldr_shift() {
+        use Reg::*;
+
+        // Test 64-bit load with shift by 3 (multiply by 8)
+        {
+            let mut asm = Assembler::new();
+            asm.mov_imm(X1, 1.into()); // offset = 1
+            asm.ldr_shift(X2, X0, X1); // load from [X0 + (1 << 3)] = [X0 + 8]
+            asm.mov(X0, X2);
+            asm.ret();
+
+            let exec = ExecutableMem::from_bytes_copy(&asm.emit());
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(*const usize) -> usize>(exec.addr)
+            };
+
+            let input: [usize; 4] = [10, 20, 30, 40];
+            assert_eq!(func(input.as_ptr()), 20); // input[1]
+        }
+
+        // Test 32-bit load with shift by 2 (multiply by 4)
+        {
+            let mut asm = Assembler::new();
+            asm.mov_imm(X1, 2.into()); // offset = 2
+            asm.ldr_shift(W2, X0, X1); // load from [X0 + (2 << 2)] = [X0 + 8]
+            asm.mov(X0, X2);
+            asm.ret();
+
+            let exec = ExecutableMem::from_bytes_copy(&asm.emit());
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(*const u32) -> u32>(exec.addr) };
+
+            let input: [u32; 8] = [100, 200, 300, 400, 500, 600, 700, 800];
+            assert_eq!(func(input.as_ptr()), 300); // input[2]
+        }
+    }
+
+    #[test]
     fn test_assembler_adr() {
         use Reg::*;
 
@@ -3479,5 +3560,96 @@ mod test {
         // assert_eq!(func(1), 1);
         // assert_eq!(func(2), 1);
         // assert_eq!(func(3), 2);
+    }
+
+    #[test]
+    fn test_assembler_add_shift() {
+        use Reg::*;
+        // Shift by 1, 64-bit
+        {
+            let mut assembler = Assembler::new();
+            assembler.add_shift(X0, X0, X1, ShiftKind::Lsl, Imm::U8(1));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr)
+            };
+            assert_eq!(func(1, 2), 1 + (2 << 1));
+            assert_eq!(func(0, 0), 0);
+            assert_eq!(func(10, 3), 10 + 6);
+        }
+
+        // Shift by 2, 32-bit
+        {
+            let mut assembler = Assembler::new();
+            assembler.add_shift(W0, W0, W1, ShiftKind::Lsl, Imm::U8(2));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(u32, u32) -> u32>(exec.addr) };
+            assert_eq!(func(1, 2), 1 + (2 << 2));
+            assert_eq!(func(0, 0), 0);
+            assert_eq!(func(10, 3), 10 + 12);
+        }
+
+        // Shift by 3, 64-bit
+        {
+            let mut assembler = Assembler::new();
+            assembler.add_shift(X0, X0, X1, ShiftKind::Lsl, Imm::U8(3));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr)
+            };
+            assert_eq!(func(1, 2), 1 + (2 << 3));
+            assert_eq!(func(0, 0), 0);
+            assert_eq!(func(10, 3), 10 + (3 << 3));
+        }
+
+        // Shift by 3, 32-bit
+        {
+            let mut assembler = Assembler::new();
+            assembler.add_shift(W0, W0, W1, ShiftKind::Lsl, Imm::U8(3));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(u32, u32) -> u32>(exec.addr) };
+            assert_eq!(func(1, 2), 1 + (2 << 3));
+            assert_eq!(func(0, 0), 0);
+            assert_eq!(func(10, 3), 10 + (3 << 3));
+        }
+
+        // Shift by 4, 64-bit
+        {
+            let mut assembler = Assembler::new();
+            assembler.add_shift(X0, X0, X1, ShiftKind::Lsl, Imm::U8(4));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr)
+            };
+            assert_eq!(func(1, 2), 1 + (2 << 4));
+            assert_eq!(func(0, 0), 0);
+            assert_eq!(func(10, 3), 10 + (3 << 4));
+        }
+
+        // Shift by 4, 32-bit
+        {
+            let mut assembler = Assembler::new();
+            assembler.add_shift(W0, W0, W1, ShiftKind::Lsl, Imm::U8(4));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(u32, u32) -> u32>(exec.addr) };
+            assert_eq!(func(1, 2), 1 + (2 << 4));
+            assert_eq!(func(0, 0), 0);
+            assert_eq!(func(10, 3), 10 + (3 << 4));
+        }
     }
 }
