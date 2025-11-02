@@ -1,9 +1,10 @@
 #![feature(variant_count)]
 use std::ffi::{c_int, c_void};
 
+use std::process::Output;
 use std::{collections::HashMap, io::Write, ops::Neg};
 
-use bitfield::{BitRange, BitRangeMut};
+use bitfield::{BitMut, BitRange, BitRangeMut};
 
 macro_rules! as_fn {
     ($exec:expr, ($($arg:ty),*) -> $ret:ty) => {
@@ -354,6 +355,10 @@ impl Imm {
             Imm::U64(imm) => *imm as usize,
         }
     }
+
+    pub fn as_u32(&self) -> u32 {
+        self.as_usize().try_into().unwrap()
+    }
 }
 
 #[derive(PartialEq, Clone, Eq, Debug)]
@@ -399,9 +404,12 @@ impl ShiftKind {
 #[derive(Debug)]
 pub enum Instr {
     Adr(Reg, Label),
+    Ands(Reg, Reg, Imm),
+
     Br(Reg),
     Blr(Reg),
 
+    Csinc(Reg, Reg, Reg, CC),
     Cset(Reg, CC),
 
     Cb(bool, Reg, Label),
@@ -423,6 +431,7 @@ pub enum Instr {
 
     Ldr(Reg, Reg, Reg),
     LdrShift(Reg, Reg, Reg),
+    LdrImm(Reg, Reg, Imm),
     LdrImmPostIndex(Reg, Reg, Imm),
     LdrImmPreIndex(Reg, Reg, Imm),
     LdrhImmPostIndex(Reg, Reg, Imm),
@@ -461,8 +470,12 @@ pub enum Instr {
 
 const ADR: u32 = 0b0_00_10000_0000000000000000000_00000;
 
-const CSET_32: u32 = 0b0001101010011111_0000_0_111111_00000;
-const CSET_64: u32 = 0b1001101010011111_0000_0_111111_00000;
+const ANDS_IMM_32: u32 = 0b0_11100100_0_000000_000000_00000_00000;
+const ANDS_IMM_64: u32 = 0b1_11100100_0_000000_000000_00000_00000;
+
+/// https://developer.arm.com/documentation/ddi0602/2025-03/Base-Instructions/CSINC--Conditional-select-increment-?lang=en
+const CSINC_32: u32 = 0b0_0011010100_00000_0000_01_00000_00000;
+const CSINC_64: u32 = 0b1_0011010100_00000_0000_01_00000_00000;
 
 const CBZ_32: u32 = 0b00110100_0000000000000000000_00000;
 const CBZ_64: u32 = 0b10110100_0000000000000000000_00000;
@@ -486,6 +499,8 @@ const LDR_IMM_POST_INDEX_32: u32 = 0b10111000010_000000000_01_00000_00000;
 const LDR_IMM_POST_INDEX_64: u32 = 0b11111000010_000000000_01_00000_00000;
 const LDR_IMM_PRE_INDEX_32: u32 = 0b10_111000010_000000000_11_00000_00000;
 const LDR_IMM_PRE_INDEX_64: u32 = 0b11_111000010_000000000_11_00000_00000;
+const LDR_IMM_32: u32 = 0b1_0_11100101_000000000000_00000_00000;
+const LDR_IMM_64: u32 = 0b1_1_11100101_000000000000_00000_00000;
 
 const LDRH_IMM_POST_INDEX_32: u32 = 0b01111000010_000000000_01_00000_00000;
 
@@ -661,6 +676,7 @@ impl Assembler {
                 Instr::Adr(_, l) => {
                     // TODO: Can we omit this? It owuld
                 }
+                Instr::Ands(reg, reg1, imm) => {}
                 Instr::Stp(reg, reg1, reg2, imm) => {}
                 Instr::SubsExtReg(reg, reg1, reg2) => {}
                 Instr::Orr(reg, reg1, imm) => {}
@@ -670,11 +686,13 @@ impl Assembler {
                 Instr::StpPreIndex(reg, reg1, reg2, imm) => {}
                 Instr::Ldp(reg, reg1, reg2, imm) => {}
                 Instr::LdpPostIndex(reg, reg1, reg2, imm) => {}
+                Instr::Csinc(reg, reg1, reg2, cc) => {}
                 Instr::Cset(reg, cc) => {}
                 Instr::Str(reg, reg1, reg2) => {}
                 Instr::StrbPostIndex(reg, reg1, imm) => {}
                 Instr::Ldr(reg, reg1, reg2) => {}
                 Instr::LdrShift(reg, reg1, reg2) => {}
+                Instr::LdrImm(reg, reg1, imm) => {}
                 Instr::LdrImmPostIndex(reg, reg1, imm) => {}
                 Instr::LdrImmPreIndex(reg, reg1, imm) => {}
                 Instr::LdrhImmPostIndex(reg, reg1, imm) => {}
@@ -739,6 +757,13 @@ impl Assembler {
         self.instrs.push(Instr::Cset(reg, cc));
     }
 
+    /// This instruction returns, in the destination register, the value of the
+    /// first source register if the condition is TRUE, and otherwise returns
+    /// the value of the second source register incremented by 1.
+    pub fn csinc(&mut self, dest: Reg, a: Reg, b: Reg, cc: CC) {
+        self.instrs.push(Instr::Csinc(dest, a, b, cc));
+    }
+
     pub fn cbz(&mut self, reg: Reg, label: Label) {
         self.instrs.push(Instr::Cb(true, reg, label));
     }
@@ -773,6 +798,15 @@ impl Assembler {
         assert_ne!(offset, Reg::SP);
         assert!(base.is_64bit());
         self.instrs.push(Instr::LdrShift(out, base, offset));
+    }
+
+    pub fn ldr_imm(&mut self, out: Reg, base: Reg, offset: Imm) {
+        assert!(base.is_64bit());
+        let max = if out.is_64bit() { 32760 } else { 16384 };
+        assert!(offset.as_usize() <= max);
+        let align = if out.is_64bit() { 8 } else { 4 };
+        assert!(offset.as_usize() % align == 0);
+        self.instrs.push(Instr::LdrImm(out, base, offset));
     }
 
     pub fn ldr_imm_post_index(&mut self, out: Reg, base: Reg, offset: Imm) {
@@ -832,6 +866,11 @@ impl Assembler {
     pub fn add_shift(&mut self, out: Reg, a: Reg, b: Reg, shift: ShiftKind, imm: Imm) {
         assert_eq!(out.is_32bit(), a.is_32bit());
         assert_eq!(a.is_32bit(), b.is_32bit());
+        assert_eq!(
+            shift,
+            ShiftKind::Lsl,
+            "Only LSL is supported for add_shift right now"
+        );
 
         self.instrs
             .push(Instr::AddShift(out, a, b, ShiftKind::Lsl, imm));
@@ -990,6 +1029,13 @@ impl Assembler {
 
     pub fn adr(&mut self, out: Reg, label: Label) {
         self.instrs.push(Instr::Adr(out, label));
+    }
+
+    pub fn ands(&mut self, out: Reg, a: Reg, imm: Imm) {
+        assert_eq!(out.is_64bit(), a.is_64bit());
+        let bits = if out.is_64bit() { 13 } else { 12 };
+        assert!(imm.as_usize() < (1 << bits));
+        self.instrs.push(Instr::Ands(out, a, imm));
     }
 
     pub fn jump(&mut self, label: Label) {
@@ -1156,6 +1202,28 @@ impl Assembler {
         mut outbuf: impl Write,
     ) -> std::io::Result<()> {
         match instr {
+            Instr::Ands(out, a, imm) => {
+                assert_eq!(out.is_64bit(), a.is_64bit());
+                let bits = if out.is_64bit() { 13 } else { 12 };
+                assert!(imm.as_usize() < (1 << bits));
+
+                let mut instr_bits = if out.is_64bit() {
+                    ANDS_IMM_64
+                } else {
+                    ANDS_IMM_32
+                };
+
+                instr_bits.set_bit_range(4, 0, out.as_bits());
+                instr_bits.set_bit_range(9, 5, a.as_bits());
+                if out.is_64bit() {
+                    instr_bits.set_bit_range(22, 10, imm.as_usize() as u64);
+                } else {
+                    instr_bits.set_bit_range(21, 10, imm.as_usize() as u32);
+                }
+
+                outbuf.write_all(&instr_bits.to_le_bytes())?;
+                Ok(())
+            }
             Instr::Blr(reg) => {
                 assert!(reg.is_64bit());
                 let mut instr_bits = BLR;
@@ -1190,11 +1258,26 @@ impl Assembler {
 
                 outbuf.write_all(&instr_bits.to_le_bytes())
             }
+            Instr::Csinc(dest, a, b, cc) => {
+                assert_eq!(dest.is_64bit(), a.is_64bit());
+                assert_eq!(a.is_64bit(), b.is_64bit());
+
+                let mut instr_bits = if dest.is_64bit() { CSINC_64 } else { CSINC_32 };
+                instr_bits.set_bit_range(4, 0, dest.as_bits());
+                instr_bits.set_bit_range(9, 5, a.as_bits());
+                instr_bits.set_bit_range(20, 16, b.as_bits());
+                let cc_bits = cc.as_bits();
+                instr_bits.set_bit_range(15, 12, cc_bits);
+
+                outbuf.write_all(&instr_bits.to_le_bytes())
+            }
             Instr::Cset(reg, cc) => {
-                let mut instr_bits = if reg.is_64bit() { CSET_64 } else { CSET_32 };
+                let mut instr_bits = if reg.is_64bit() { CSINC_64 } else { CSINC_32 };
+                let zero_reg = if reg.is_64bit() { Reg::XZR } else { Reg::WZR };
                 instr_bits.set_bit_range(4, 0, reg.as_bits());
+                instr_bits.set_bit_range(20, 16, zero_reg.as_bits());
+                instr_bits.set_bit_range(9, 5, zero_reg.as_bits());
                 let cc_bits = cc.invert().as_bits();
-                // let cc_bits = cc.as_bits();
                 instr_bits.set_bit_range(15, 12, cc_bits);
 
                 outbuf.write_all(&instr_bits.to_le_bytes())
@@ -1479,6 +1562,25 @@ impl Assembler {
                 instrbits.set_bit_range(20, 12, value as u32);
                 outbuf.write_all(&instrbits.to_le_bytes())?;
                 Ok(())
+            }
+            Instr::LdrImm(out, base, offset) => {
+                let mut instrbits = if out.is_64bit() {
+                    LDR_IMM_64
+                } else {
+                    LDR_IMM_32
+                };
+                assert!(base.is_64bit());
+                let max = if out.is_64bit() { 32760 } else { 16384 };
+                assert!(offset.as_usize() <= max);
+                let align = if out.is_64bit() { 8 } else { 4 };
+                assert!(offset.as_usize() % align == 0);
+                let offset_value = offset.as_usize() / align;
+
+                instrbits.set_bit_range(21, 10, offset_value as u32);
+                instrbits.set_bit_range(9, 5, base.as_bits());
+                instrbits.set_bit_range(4, 0, out.as_bits());
+
+                outbuf.write_all(&instrbits.to_le_bytes())
             }
             Instr::LdrhImmPostIndex(out, base, offset) => {
                 assert!(out.is_32bit());
@@ -1842,6 +1944,14 @@ impl Assembler {
 impl Instr {
     pub fn as_asm(&self) -> String {
         match self {
+            Instr::Ands(out, a, imm) => {
+                format!(
+                    "ands\t{}, {}, #{}",
+                    out.as_asm(),
+                    a.as_asm(),
+                    imm.as_usize()
+                )
+            }
             Instr::Orr(dest, src, imm) => {
                 format!(
                     "orr\t{}, {}, #{}",
@@ -1891,6 +2001,15 @@ impl Instr {
             }
             Instr::Adr(reg, label) => {
                 format!("adr\t{}, .L{}", reg.as_asm(), label.as_ref())
+            }
+            Instr::Csinc(dest, a, b, cc) => {
+                format!(
+                    "cinc\t{}, {}, {}, {}",
+                    dest.as_asm(),
+                    a.as_asm(),
+                    b.as_asm(),
+                    cc.as_asm()
+                )
             }
             Instr::Cset(reg, cc) => {
                 format!("cset\t{}, {}", reg.as_asm(), cc.as_asm())
@@ -1954,6 +2073,14 @@ impl Instr {
             Instr::LdrhImmPostIndex(out, base, offset) => {
                 format!(
                     "ldrh\t{}, [{}], #{}",
+                    out.as_asm(),
+                    base.as_asm(),
+                    offset.as_isize()
+                )
+            }
+            Instr::LdrImm(out, base, offset) => {
+                format!(
+                    "ldr\t{}, [{}, #{}]",
                     out.as_asm(),
                     base.as_asm(),
                     offset.as_isize()
@@ -2811,6 +2938,76 @@ mod test {
     }
 
     #[test]
+    fn test_assembler_ldr_imm() {
+        use Reg::*;
+
+        // Test 64-bit load with offset 0
+        {
+            let input: [u64; 2] = [0x1122334455667788, 0xAABBCCDDEEFF0011];
+            let mut assembler = Assembler::new();
+            assembler.ldr_imm(X0, X0, Imm::U32(0));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func: extern "C" fn(*const u64) -> u64 =
+                unsafe { std::mem::transmute(exec.addr) };
+            assert_eq!(func(input.as_ptr()), 0x1122334455667788);
+        }
+
+        // Test 64-bit load with offset 8
+        {
+            let input: [u64; 2] = [0x1122334455667788, 0xAABBCCDDEEFF0011];
+            let mut assembler = Assembler::new();
+            assembler.ldr_imm(X0, X0, Imm::U32(8));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func: extern "C" fn(*const u64) -> u64 =
+                unsafe { std::mem::transmute(exec.addr) };
+            assert_eq!(func(input.as_ptr()), 0xAABBCCDDEEFF0011);
+        }
+
+        // Test 32-bit load with offset 0
+        {
+            let input: [u32; 4] = [0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00];
+            let mut assembler = Assembler::new();
+            assembler.ldr_imm(W0, X0, Imm::U32(0));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func: extern "C" fn(*const u32) -> u32 =
+                unsafe { std::mem::transmute(exec.addr) };
+            assert_eq!(func(input.as_ptr()), 0x11223344);
+        }
+
+        // Test 32-bit load with offset 4
+        {
+            let input: [u32; 4] = [0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00];
+            let mut assembler = Assembler::new();
+            assembler.ldr_imm(W0, X0, Imm::U32(4));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func: extern "C" fn(*const u32) -> u32 =
+                unsafe { std::mem::transmute(exec.addr) };
+            assert_eq!(func(input.as_ptr()), 0x55667788);
+        }
+
+        // Test 32-bit load with offset 8
+        {
+            let input: [u32; 4] = [0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00];
+            let mut assembler = Assembler::new();
+            assembler.ldr_imm(W0, X0, Imm::U32(8));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func: extern "C" fn(*const u32) -> u32 =
+                unsafe { std::mem::transmute(exec.addr) };
+            assert_eq!(func(input.as_ptr()), 0x99AABBCC);
+        }
+    }
+
+    #[test]
     fn test_assembler_ldr_imm_pre_index() {
         use Reg::*;
 
@@ -3034,6 +3231,61 @@ mod test {
 
         assert_eq!(func(0), 1);
         assert_eq!(func(1), 0);
+    }
+
+    #[test]
+    fn test_assembler_csinc() {
+        let mut assembler = Assembler::new();
+        assembler.cmp_imm(Reg::X0, Imm::U32(10));
+        assembler.csinc(Reg::X0, Reg::X0, Reg::X1, CC::Eq);
+        assembler.ret();
+        let bytes = assembler.emit();
+        let exec = ExecutableMem::from_bytes_copy(&bytes);
+        let func =
+            unsafe { std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr) };
+
+        // If X0 == 10, return X0 (10), else return X1 + 1
+        assert_eq!(func(10, 5), 10); // condition true, return Rn (X0)
+        assert_eq!(func(5, 3), 4); // condition false, return Rm + 1 (X1 + 1)
+        assert_eq!(func(0, 7), 8); // condition false, return Rm + 1
+        assert_eq!(func(20, 1), 2); // condition false, return Rm + 1
+    }
+
+    #[test]
+    fn test_assembler_ands() {
+        // Test 64-bit ands
+        {
+            let mut assembler = Assembler::new();
+            // X0 = X0 & 0xFF (mask lower 8 bits)
+            // Encoded as N=1, immr=0, imms=7 -> 0x1007
+            assembler.ands(Reg::X0, Reg::X0, Imm::U32(0x1007));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn(u64) -> u64>(exec.addr) };
+
+            assert_eq!(func(0x12345678), 0x78);
+            assert_eq!(func(0xABCDEF00), 0x00);
+            assert_eq!(func(0xFFFFFFFF), 0xFF);
+            assert_eq!(func(0x000000AA), 0xAA);
+        }
+
+        // Test 32-bit ands
+        {
+            let mut assembler = Assembler::new();
+            // W0 = W0 & 0xF0 (mask bits 4-7)
+            // Encoded as N=0, immr=28, imms=3 -> 0x0703
+            assembler.ands(Reg::W0, Reg::W0, Imm::U32(0x0703));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn(u32) -> u32>(exec.addr) };
+
+            assert_eq!(func(0x12345678), 0x70);
+            assert_eq!(func(0xABCDEF0F), 0x00);
+            assert_eq!(func(0xFFFFFFFF), 0xF0);
+            assert_eq!(func(0x000000A5), 0xA0);
+        }
     }
 
     #[test]
