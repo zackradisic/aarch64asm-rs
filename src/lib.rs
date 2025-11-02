@@ -438,6 +438,7 @@ pub enum Instr {
     LdrhImmPostIndex(Reg, Reg, Imm),
 
     Ldrb(Reg, Reg, Reg),
+    LdrbImm(Reg, Reg, Imm),
     LdrbImmPostIndex(Reg, Reg, Imm),
     Ldr32ImmPostIndex(Reg, Reg, Imm),
     Ldr64ImmPostIndex(Reg, Reg, Imm),
@@ -453,6 +454,7 @@ pub enum Instr {
     // not implementing extend or shift right now
     SubsExtReg(Reg, Reg, Reg),
     Sub(Reg, Reg, Reg),
+    SubShift(Reg, Reg, Reg, ShiftKind, Imm),
     SubImm(Reg, Reg, Imm),
 
     Madd(Reg, Reg, Reg, Reg),
@@ -504,6 +506,8 @@ const LDR_IMM_32: u32 = 0b1_0_11100101_000000000000_00000_00000;
 const LDR_IMM_64: u32 = 0b1_1_11100101_000000000000_00000_00000;
 
 const LDRH_IMM_POST_INDEX_32: u32 = 0b01111000010_000000000_01_00000_00000;
+
+const LDRB_IMM: u32 = 0b0011100101_000000000000_00000_00000;
 
 const LDRB_IMM_POST_INDEX: u32 = 0b00111000010_000000000_0_1_00000_00000;
 // const LDR_IMM_POST_INDEX: u32 = 0b01001000010_00000000000000000000000_00000;
@@ -589,6 +593,132 @@ const MOVZ_IMM_64: u32 = 0b110100101_00_0000000000000000_00000;
 /// https://developer.arm.com/documentation/ddi0602/2025-03/Base-Instructions/LSL--immediate---Logical-shift-left--immediate---an-alias-of-UBFM-?lang=en
 const LSL_IMM_32: u32 = 0b0_10100110_0_000000_000000_00000_00000;
 const LSL_IMM_64: u32 = 0b1_10100110_0_000000_000000_00000_00000;
+
+/// Encode a bitmask immediate value for ARM64 logical instructions.
+///
+/// For 32-bit: Returns immr:imms (12 bits)
+/// For 64-bit: Returns N:immr:imms (13 bits)
+///
+/// This function finds a valid encoding for repeating bitmask patterns.
+/// Returns None if the value cannot be encoded as a valid bitmask immediate.
+fn encode_bitmask_immediate(value: u64, is_64bit: bool) -> Option<u32> {
+    if value == 0 || (!is_64bit && value == 0xFFFFFFFF) || (is_64bit && value == 0xFFFFFFFFFFFFFFFF) {
+        // All zeros or all ones cannot be encoded
+        return None;
+    }
+
+    let size = if is_64bit { 64 } else { 32 };
+    let mask = if is_64bit { u64::MAX } else { 0xFFFFFFFF };
+    let value = value & mask;
+
+    // Try different element sizes (2, 4, 8, 16, 32, or 64)
+    for element_size in [2, 4, 8, 16, 32, 64] {
+        if !is_64bit && element_size > 32 {
+            break;
+        }
+
+        // Check if the pattern repeats at this element size
+        let element_mask = if element_size == 64 {
+            u64::MAX
+        } else {
+            (1u64 << element_size) - 1
+        };
+        let element = value & element_mask;
+
+        // Verify it repeats throughout the value
+        let mut valid = true;
+        for i in (element_size..size).step_by(element_size) {
+            let chunk = (value >> i) & element_mask;
+            if chunk != element {
+                valid = false;
+                break;
+            }
+        }
+
+        if !valid {
+            continue;
+        }
+
+        // Now we have a valid repeating pattern of size element_size
+        // Check if it's a contiguous sequence of ones (possibly rotated)
+        let ones = element.count_ones();
+        let zeros = element_size as u32 - ones;
+
+        if ones == 0 || zeros == 0 {
+            continue;
+        }
+
+        // Find rotation amount where we have contiguous ones starting from bit 0
+        for rotation in 0..element_size {
+            let rotated = element.rotate_right(rotation as u32);
+
+            // Check if rotated value has contiguous ones starting from bit 0
+            let trailing_ones = rotated.trailing_ones();
+            let expected = (1u64 << trailing_ones) - 1;
+
+            if rotated == expected && trailing_ones > 0 {
+                // Found valid encoding!
+                // For the bitmask encoding:
+                // - We rotate to find a canonical form (contiguous 1s from bit 0)
+                // - immr encodes the opposite rotation to get back to original
+                // - imms encodes the element size and number of consecutive 1s
+
+                // immr is the amount to rotate RIGHT to get from canonical form to actual value
+                // Since we rotated RIGHT by 'rotation' to get canonical form,
+                // we need to rotate LEFT by 'rotation' to get back, which is
+                // rotate RIGHT by (element_size - rotation)
+                let immr = if rotation == 0 {
+                    0
+                } else {
+                    (element_size - rotation) as u32
+                };
+
+                // imms encoding depends on element size and datapath width
+                // The encoding is: highest_bit_set(~element_size) : (trailing_ones - 1)
+                // For element_size, we encode it as the index of highest set bit in (width - element_size)
+                let imms = if is_64bit {
+                    // For 64-bit operations
+                    let size_encoding = match element_size {
+                        2 => 0b111110,   // ~0b000010 in 6 bits top part
+                        4 => 0b111100,   // ~0b000100 in 6 bits top part
+                        8 => 0b111000,   // ~0b001000 in 6 bits top part
+                        16 => 0b110000,  // ~0b010000 in 6 bits top part
+                        32 => 0b100000,  // ~0b100000 in 6 bits top part
+                        64 => 0b000000,  // ~0b1000000 in 6 bits top part (overflow, so 0)
+                        _ => unreachable!(),
+                    };
+                    size_encoding | (trailing_ones - 1)
+                } else {
+                    // For 32-bit operations, element_size is at most 32
+                    // The encoding is simpler - just (trailing_ones - 1) for element_size=32
+                    if element_size == 32 {
+                        trailing_ones - 1
+                    } else {
+                        let size_encoding = match element_size {
+                            2 => 0b111110,
+                            4 => 0b111100,
+                            8 => 0b111000,
+                            16 => 0b110000,
+                            _ => unreachable!(),
+                        };
+                        size_encoding | (trailing_ones - 1)
+                    }
+                };
+
+                if is_64bit {
+                    // For 64-bit: N:immr:imms
+                    let n = if element_size == 64 { 1 } else { 0 };
+                    return Some((n << 12) | (immr << 6) | imms);
+                } else {
+                    // For 32-bit: immr:imms (N is always 0)
+                    return Some((immr << 6) | imms);
+                }
+            }
+        }
+    }
+
+    None
+}
 
 pub struct Assembler {
     pub used_registers: Vec<Reg>,
@@ -699,6 +829,7 @@ impl Assembler {
                 Instr::LdrImmPreIndex(reg, reg1, imm) => {}
                 Instr::LdrhImmPostIndex(reg, reg1, imm) => {}
                 Instr::Ldrb(reg, reg1, reg2) => {}
+                Instr::LdrbImm(_, _, _) => {}
                 Instr::LdrbImmPostIndex(reg, reg1, imm) => {}
                 Instr::Ldr32ImmPostIndex(reg, reg1, imm) => {}
                 Instr::Ldr64ImmPostIndex(reg, reg1, imm) => {}
@@ -708,6 +839,7 @@ impl Assembler {
                 Instr::Subs(reg, reg1, reg2) => {}
                 Instr::SubsImm(reg, reg1, imm, _) => {}
                 Instr::Sub(reg, reg1, reg2) => {}
+                Instr::SubShift(_, _, _, _, _) => {}
                 Instr::SubImm(reg, reg1, imm) => {}
                 Instr::Madd(reg, reg1, reg2, reg3) => {}
                 Instr::Cmp(reg, reg1) => {}
@@ -835,6 +967,13 @@ impl Assembler {
     // pub fn ldr_post_index(&mut self, out: Reg, base: Reg, offset: Imm) {
     //     self.instrs.push(Instr::LdrPostIndex(out, base, offset));
     // }
+
+    pub fn ldrb_imm(&mut self, out: Reg, base: Reg, offset: Imm) {
+        assert!(out.is_32bit());
+        assert!(base.is_64bit());
+        assert!(offset.as_usize() <= 4095);
+        self.instrs.push(Instr::LdrbImm(out, base, offset));
+    }
 
     pub fn ldrb_post_index(&mut self, out: Reg, base: Reg, offset: Imm) {
         assert!(offset.as_isize() < 256);
@@ -975,6 +1114,20 @@ impl Assembler {
         self.instrs.push(Instr::Sub(out, a, b));
     }
 
+    pub fn sub_shift(&mut self, dest: Reg, a: Reg, b: Reg, shiftkind: ShiftKind, imm: Imm) {
+        assert_eq!(dest.is_64bit(), a.is_64bit());
+        assert_eq!(a.is_64bit(), b.is_64bit());
+        assert_eq!(
+            shiftkind,
+            ShiftKind::Lsl,
+            "ShiftKind:Lsl only supported right now"
+        );
+        let max = if dest.is_64bit() { 63 } else { 31 };
+        assert!(imm.as_usize() <= max);
+        self.instrs
+            .push(Instr::SubShift(dest, a, b, shiftkind, imm));
+    }
+
     pub fn sub_imm(&mut self, out: Reg, a: Reg, b: Imm) {
         let val = b.as_usize();
         assert!(val <= 4095);
@@ -1040,11 +1193,11 @@ impl Assembler {
         self.instrs.push(Instr::Adr(out, label));
     }
 
-    pub fn ands(&mut self, out: Reg, a: Reg, imm: Imm) {
+    pub fn ands(&mut self, out: Reg, a: Reg, mask: u64) {
         assert_eq!(out.is_64bit(), a.is_64bit());
-        let bits = if out.is_64bit() { 13 } else { 12 };
-        assert!(imm.as_usize() < (1 << bits));
-        self.instrs.push(Instr::Ands(out, a, imm));
+        let encoded = encode_bitmask_immediate(mask, out.is_64bit())
+            .expect("Invalid bitmask immediate - cannot be encoded");
+        self.instrs.push(Instr::Ands(out, a, Imm::U32(encoded)));
     }
 
     pub fn jump(&mut self, label: Label) {
@@ -1213,8 +1366,6 @@ impl Assembler {
         match instr {
             Instr::Ands(out, a, imm) => {
                 assert_eq!(out.is_64bit(), a.is_64bit());
-                let bits = if out.is_64bit() { 13 } else { 12 };
-                assert!(imm.as_usize() < (1 << bits));
 
                 let mut instr_bits = if out.is_64bit() {
                     ANDS_IMM_64
@@ -1224,10 +1375,20 @@ impl Assembler {
 
                 instr_bits.set_bit_range(4, 0, out.as_bits());
                 instr_bits.set_bit_range(9, 5, a.as_bits());
+
+                // Extract imms (bits 5-0) and immr (bits 11-6) from the encoded immediate
+                let imm_val = imm.as_usize();
+                let imms = (imm_val & 0b111111) as u32;  // bits 5-0
+                let immr = ((imm_val >> 6) & 0b111111) as u32;  // bits 11-6
+
+                // Set imms (bits 15-10) and immr (bits 21-16)
+                instr_bits.set_bit_range(15, 10, imms);
+                instr_bits.set_bit_range(21, 16, immr);
+
                 if out.is_64bit() {
-                    instr_bits.set_bit_range(22, 10, imm.as_usize() as u64);
-                } else {
-                    instr_bits.set_bit_range(21, 10, imm.as_usize() as u32);
+                    // For 64-bit variant, set N bit (bit 22)
+                    let n = ((imm_val >> 12) & 1) as u32;
+                    instr_bits.set_bit_range(22, 22, n);
                 }
 
                 outbuf.write_all(&instr_bits.to_le_bytes())?;
@@ -1675,6 +1836,18 @@ impl Assembler {
             Instr::Ldrb(out, base, offset) => {
                 todo!()
             }
+            Instr::LdrbImm(out, base, offset) => {
+                assert!(out.is_32bit());
+                assert!(base.is_64bit());
+                assert!(offset.as_usize() <= 4095);
+                let mut instrbits = LDRB_IMM;
+
+                instrbits.set_bit_range(21, 10, offset.as_u32());
+                instrbits.set_bit_range(9, 5, base.as_bits());
+                instrbits.set_bit_range(4, 0, out.as_bits());
+
+                outbuf.write_all(&instrbits.to_le_bytes())
+            }
             Instr::LdrbImmPostIndex(out, base, offset) => {
                 assert!(offset.as_isize() < 256);
                 assert!(offset.as_isize() >= -256);
@@ -1826,6 +1999,25 @@ impl Assembler {
                 instrbits.set_bit_range(4, 0, dest.as_bits());
                 instrbits.set_bit_range(9, 5, a.as_bits());
                 instrbits.set_bit_range(20, 16, b.as_bits());
+                outbuf.write_all(&instrbits.to_le_bytes())
+            }
+            Instr::SubShift(dest, a, b, shiftkind, imm) => {
+                assert_eq!(dest.is_64bit(), a.is_64bit());
+                assert_eq!(a.is_64bit(), b.is_64bit());
+                assert_eq!(
+                    *shiftkind,
+                    ShiftKind::Lsl,
+                    "ShiftKind:Lsl only supported right now"
+                );
+                let max = if dest.is_64bit() { 63 } else { 31 };
+                assert!(imm.as_usize() <= max);
+
+                let mut instrbits = if dest.is_64bit() { SUB_64 } else { SUB_32 };
+                instrbits.set_bit_range(4, 0, dest.as_bits());
+                instrbits.set_bit_range(9, 5, a.as_bits());
+                instrbits.set_bit_range(23, 22, 0b00);
+                instrbits.set_bit_range(20, 16, b.as_bits());
+                instrbits.set_bit_range(15, 10, imm.as_u32());
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
             Instr::SubImm(out, left, right) => {
@@ -2156,6 +2348,14 @@ impl Instr {
                     offset.as_asm()
                 )
             }
+            Instr::LdrbImm(out, base, offset) => {
+                format!(
+                    "ldrb\t{}, [{}, #{}]",
+                    out.as_32bit().as_asm(),
+                    base.as_asm(),
+                    offset.as_usize(),
+                )
+            }
             Instr::LdrbImmPostIndex(out, base, offset) => {
                 format!(
                     "ldrb\t{}, [{}], #{}",
@@ -2222,6 +2422,16 @@ impl Instr {
             }
             Instr::Sub(out, a, b) => {
                 format!("sub\t{}, {}, {}", out.as_asm(), a.as_asm(), b.as_asm())
+            }
+            Instr::SubShift(out, a, b, shift, imm) => {
+                assert_eq!(*shift, ShiftKind::Lsl);
+                format!(
+                    "sub\t{}, {}, {}, lsl #{}",
+                    out.as_asm(),
+                    a.as_asm(),
+                    b.as_asm(),
+                    imm.as_usize()
+                )
             }
             Instr::SubImm(out, a, b) => {
                 format!("sub\t{}, {}, #{}", out.as_asm(), a.as_asm(), b.as_isize())
@@ -3280,8 +3490,7 @@ mod test {
         {
             let mut assembler = Assembler::new();
             // X0 = X0 & 0xFF (mask lower 8 bits)
-            // Encoded as N=1, immr=0, imms=7 -> 0x1007
-            assembler.ands(Reg::X0, Reg::X0, Imm::U32(0x1007));
+            assembler.ands(Reg::X0, Reg::X0, 0xFF);
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
@@ -3297,8 +3506,7 @@ mod test {
         {
             let mut assembler = Assembler::new();
             // W0 = W0 & 0xF0 (mask bits 4-7)
-            // Encoded as N=0, immr=28, imms=3 -> 0x0703
-            assembler.ands(Reg::W0, Reg::W0, Imm::U32(0x0703));
+            assembler.ands(Reg::W0, Reg::W0, 0xF0);
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
@@ -3308,6 +3516,30 @@ mod test {
             assert_eq!(func(0xABCDEF0F), 0x00);
             assert_eq!(func(0xFFFFFFFF), 0xF0);
             assert_eq!(func(0x000000A5), 0xA0);
+        }
+
+        // Test checking if a number is even using ANDS x1, x0, #0x1
+        {
+            let mut assembler = Assembler::new();
+            // X1 = X0 & 0x1 (isolate least significant bit)
+            assembler.ands(Reg::X1, Reg::X0, 0x1);
+            assembler.mov(Reg::X0, Reg::X1);
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn(u64) -> u64>(exec.addr) };
+
+            // Even numbers should return 0
+            assert_eq!(func(0), 0);
+            assert_eq!(func(2), 0);
+            assert_eq!(func(42), 0);
+            assert_eq!(func(1000), 0);
+
+            // Odd numbers should return 1
+            assert_eq!(func(1), 1);
+            assert_eq!(func(3), 1);
+            assert_eq!(func(43), 1);
+            assert_eq!(func(1001), 1);
         }
     }
 
@@ -3522,8 +3754,7 @@ mod test {
 
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func: extern "C" fn(*mut u64) =
-                unsafe { std::mem::transmute(exec.addr) };
+            let func: extern "C" fn(*mut u64) = unsafe { std::mem::transmute(exec.addr) };
 
             func(output.as_mut_ptr());
             assert_eq!(output[0], 0x1111);
@@ -3563,8 +3794,7 @@ mod test {
 
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func: extern "C" fn(*mut u32) =
-                unsafe { std::mem::transmute(exec.addr) };
+            let func: extern "C" fn(*mut u32) = unsafe { std::mem::transmute(exec.addr) };
 
             func(output.as_mut_ptr());
             assert_eq!(output[0], 0xAAAA);
@@ -3606,6 +3836,41 @@ mod test {
         let input = b"HELLO";
         let mut output: [u8; 5] = [0; 5];
         assert_eq!(func(input.as_ptr(), output.as_mut_ptr(), 0), 1);
+    }
+
+    #[test]
+    fn test_assembler_ldrb_imm() {
+        use Reg::*;
+        let mut assembler = Assembler::new();
+
+        // Load byte at offset 0 into W1
+        assembler.ldrb_imm(W1, X0, Imm::U32(0));
+        // Load byte at offset 1 into W2
+        assembler.ldrb_imm(W2, X0, Imm::U32(1));
+        // Load byte at offset 2 into W3
+        assembler.ldrb_imm(W3, X0, Imm::U32(2));
+        // Load byte at offset 3 into W4
+        assembler.ldrb_imm(W4, X0, Imm::U32(3));
+        // Load byte at offset 4 into W5
+        assembler.ldrb_imm(W5, X0, Imm::U32(4));
+
+        // Add all bytes together: b0 + b1 + b2 + b3 + b4
+        // X0 = W1 + W2 + W3 + W4 + W5
+        assembler.add(X0, X1, X2);
+        assembler.add(X0, X0, X3);
+        assembler.add(X0, X0, X4);
+        assembler.add(X0, X0, X5);
+
+        assembler.ret();
+
+        let bytes = assembler.emit();
+        let exec = ExecutableMem::from_bytes_copy(&bytes);
+        let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u64>(exec.addr) };
+
+        // "HELLO" = H(72) + E(69) + L(76) + L(76) + O(79) = 372
+        let input = b"HELLO";
+        let expected = input.iter().map(|&b| b as u64).sum::<u64>();
+        assert_eq!(func(input.as_ptr()), expected);
     }
 
     #[test]
@@ -3692,6 +3957,67 @@ mod test {
             let func =
                 unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
             assert_eq!(func(0), 0);
+        }
+    }
+
+    #[test]
+    fn test_assembler_sub_shift() {
+        use Reg::*;
+        // Shift by 1, 64-bit
+        {
+            let mut assembler = Assembler::new();
+            assembler.sub_shift(X0, X0, X1, ShiftKind::Lsl, Imm::U8(1));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr)
+            };
+            assert_eq!(func(10, 2), 10 - (2 << 1)); // 10 - 4 = 6
+            assert_eq!(func(0, 0), 0);
+            assert_eq!(func(20, 3), 20 - 6); // 20 - 6 = 14
+        }
+
+        // Shift by 2, 32-bit
+        {
+            let mut assembler = Assembler::new();
+            assembler.sub_shift(W0, W0, W1, ShiftKind::Lsl, Imm::U8(2));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(u32, u32) -> u32>(exec.addr) };
+            assert_eq!(func(20, 2), 20 - (2 << 2)); // 20 - 8 = 12
+            assert_eq!(func(0, 0), 0);
+            assert_eq!(func(50, 3), 50 - 12); // 50 - 12 = 38
+        }
+
+        // Shift by 3, 64-bit
+        {
+            let mut assembler = Assembler::new();
+            assembler.sub_shift(X0, X0, X1, ShiftKind::Lsl, Imm::U8(3));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr)
+            };
+            assert_eq!(func(100, 5), 100 - (5 << 3)); // 100 - 40 = 60
+            assert_eq!(func(64, 4), 64 - 32); // 64 - 32 = 32
+        }
+
+        // Edge case: shift by 0
+        {
+            let mut assembler = Assembler::new();
+            assembler.sub_shift(X0, X0, X1, ShiftKind::Lsl, Imm::U8(0));
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(exec.addr)
+            };
+            assert_eq!(func(10, 3), 10 - 3); // 10 - 3 = 7
+            assert_eq!(func(5, 2), 3);
         }
     }
 
