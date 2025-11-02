@@ -421,6 +421,7 @@ pub enum Instr {
     StrImmPostIndex(Reg, Reg, Imm),
     StrImmPreIndex(Reg, Reg, Imm),
     Str(Reg, Reg, Reg),
+    StrShift(Reg, Reg, Reg),
     StrbPostIndex(Reg, Reg, Imm),
 
     StpPreIndex(Reg, Reg, Reg, Imm),
@@ -689,6 +690,7 @@ impl Assembler {
                 Instr::Csinc(reg, reg1, reg2, cc) => {}
                 Instr::Cset(reg, cc) => {}
                 Instr::Str(reg, reg1, reg2) => {}
+                Instr::StrShift(reg, reg1, reg2) => {}
                 Instr::StrbPostIndex(reg, reg1, imm) => {}
                 Instr::Ldr(reg, reg1, reg2) => {}
                 Instr::LdrShift(reg, reg1, reg2) => {}
@@ -981,6 +983,13 @@ impl Assembler {
 
     pub fn str(&mut self, source: Reg, base: Reg, offset: Reg) {
         self.instrs.push(Instr::Str(source, base, offset));
+    }
+
+    /// For 32-bit, shifts the offset by 2 bits
+    /// For 64-bit, shifts the offset by 3 bits
+    pub fn str_shift(&mut self, source: Reg, base: Reg, offset: Reg) {
+        assert!(base.is_64bit());
+        self.instrs.push(Instr::StrShift(source, base, offset));
     }
 
     pub fn str_imm_offset(&mut self, source: Reg, base: Reg, offset: Imm) {
@@ -1552,6 +1561,15 @@ impl Assembler {
                 instrbits.set_bit_range(15, 13, 0b011);
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
+            Instr::StrShift(source, base, offset) => {
+                let mut instrbits = if source.is_64bit() { STR_64 } else { STR_32 };
+                instrbits.set_bit_range(4, 0, source.as_bits());
+                instrbits.set_bit_range(9, 5, base.as_bits());
+                instrbits.set_bit_range(20, 16, offset.as_bits());
+                instrbits.set_bit_range(15, 13, 0b011);
+                instrbits.set_bit(12, true);
+                outbuf.write_all(&instrbits.to_le_bytes())
+            }
             Instr::StrbPostIndex(out, base, offset) => {
                 let value = offset.as_isize();
                 assert!(value < 256);
@@ -2060,6 +2078,16 @@ impl Instr {
                     source.as_asm(),
                     base.as_asm(),
                     offset.as_asm()
+                )
+            }
+            Instr::StrShift(source, base, offset) => {
+                let shift = if source.is_64bit() { 3 } else { 2 };
+                format!(
+                    "str\t{}, [{}, {}, lsl #{}]",
+                    source.as_asm(),
+                    base.as_asm(),
+                    offset.as_asm(),
+                    shift
                 )
             }
             Instr::StrbPostIndex(out, base, offset) => {
@@ -2949,8 +2977,7 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func: extern "C" fn(*const u64) -> u64 =
-                unsafe { std::mem::transmute(exec.addr) };
+            let func: extern "C" fn(*const u64) -> u64 = unsafe { std::mem::transmute(exec.addr) };
             assert_eq!(func(input.as_ptr()), 0x1122334455667788);
         }
 
@@ -2962,8 +2989,7 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func: extern "C" fn(*const u64) -> u64 =
-                unsafe { std::mem::transmute(exec.addr) };
+            let func: extern "C" fn(*const u64) -> u64 = unsafe { std::mem::transmute(exec.addr) };
             assert_eq!(func(input.as_ptr()), 0xAABBCCDDEEFF0011);
         }
 
@@ -2975,8 +3001,7 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func: extern "C" fn(*const u32) -> u32 =
-                unsafe { std::mem::transmute(exec.addr) };
+            let func: extern "C" fn(*const u32) -> u32 = unsafe { std::mem::transmute(exec.addr) };
             assert_eq!(func(input.as_ptr()), 0x11223344);
         }
 
@@ -2988,8 +3013,7 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func: extern "C" fn(*const u32) -> u32 =
-                unsafe { std::mem::transmute(exec.addr) };
+            let func: extern "C" fn(*const u32) -> u32 = unsafe { std::mem::transmute(exec.addr) };
             assert_eq!(func(input.as_ptr()), 0x55667788);
         }
 
@@ -3001,8 +3025,7 @@ mod test {
             assembler.ret();
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func: extern "C" fn(*const u32) -> u32 =
-                unsafe { std::mem::transmute(exec.addr) };
+            let func: extern "C" fn(*const u32) -> u32 = unsafe { std::mem::transmute(exec.addr) };
             assert_eq!(func(input.as_ptr()), 0x99AABBCC);
         }
     }
@@ -3462,6 +3485,93 @@ mod test {
         let mut input = vec![0; 5];
         func(input.as_mut_ptr());
         assert_eq!(input.as_slice(), b"HELLO");
+    }
+
+    #[test]
+    fn test_assembler_str_shift() {
+        use Reg::*;
+
+        // Test 64-bit store with shift (lsl #3)
+        // When offset=0, stores at base[0]
+        // When offset=1, stores at base[1] (8 bytes later)
+        // When offset=2, stores at base[2] (16 bytes later)
+        {
+            let mut output: [u64; 4] = [0; 4];
+            let mut assembler = Assembler::new();
+
+            // X0 = base pointer
+            // X1 = index (will be shifted by 3)
+            // X2 = value to store
+
+            // Store 0x1111 at output[0]
+            assembler.mov_imm(X1, Imm::U32(0));
+            assembler.mov_imm(X2, Imm::U32(0x1111));
+            assembler.str_shift(X2, X0, X1);
+
+            // Store 0x2222 at output[1]
+            assembler.mov_imm(X1, Imm::U32(1));
+            assembler.mov_imm(X2, Imm::U32(0x2222));
+            assembler.str_shift(X2, X0, X1);
+
+            // Store 0x3333 at output[2]
+            assembler.mov_imm(X1, Imm::U32(2));
+            assembler.mov_imm(X2, Imm::U32(0x3333));
+            assembler.str_shift(X2, X0, X1);
+
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func: extern "C" fn(*mut u64) =
+                unsafe { std::mem::transmute(exec.addr) };
+
+            func(output.as_mut_ptr());
+            assert_eq!(output[0], 0x1111);
+            assert_eq!(output[1], 0x2222);
+            assert_eq!(output[2], 0x3333);
+            assert_eq!(output[3], 0);
+        }
+
+        // Test 32-bit store with shift (lsl #2)
+        // When offset=0, stores at base[0]
+        // When offset=1, stores at base[1] (4 bytes later)
+        // When offset=2, stores at base[2] (8 bytes later)
+        {
+            let mut output: [u32; 4] = [0; 4];
+            let mut assembler = Assembler::new();
+
+            // X0 = base pointer
+            // X1 = index (will be shifted by 2)
+            // W2 = value to store
+
+            // Store 0xAAAA at output[0]
+            assembler.mov_imm(X1, Imm::U32(0));
+            assembler.mov_imm(W2, Imm::U32(0xAAAA));
+            assembler.str_shift(W2, X0, X1);
+
+            // Store 0xBBBB at output[1]
+            assembler.mov_imm(X1, Imm::U32(1));
+            assembler.mov_imm(W2, Imm::U32(0xBBBB));
+            assembler.str_shift(W2, X0, X1);
+
+            // Store 0xCCCC at output[2]
+            assembler.mov_imm(X1, Imm::U32(2));
+            assembler.mov_imm(W2, Imm::U32(0xCCCC));
+            assembler.str_shift(W2, X0, X1);
+
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func: extern "C" fn(*mut u32) =
+                unsafe { std::mem::transmute(exec.addr) };
+
+            func(output.as_mut_ptr());
+            assert_eq!(output[0], 0xAAAA);
+            assert_eq!(output[1], 0xBBBB);
+            assert_eq!(output[2], 0xCCCC);
+            assert_eq!(output[3], 0);
+        }
     }
 
     #[test]
