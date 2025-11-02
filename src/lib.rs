@@ -435,6 +435,7 @@ pub enum Instr {
     LdrImm(Reg, Reg, Imm),
     LdrImmPostIndex(Reg, Reg, Imm),
     LdrImmPreIndex(Reg, Reg, Imm),
+    LdrhImm(Reg, Reg, Imm),
     LdrhImmPostIndex(Reg, Reg, Imm),
 
     Ldrb(Reg, Reg, Reg),
@@ -506,6 +507,8 @@ const LDR_IMM_PRE_INDEX_64: u32 = 0b11_111000010_000000000_11_00000_00000;
 const LDR_IMM_32: u32 = 0b1_0_11100101_000000000000_00000_00000;
 const LDR_IMM_64: u32 = 0b1_1_11100101_000000000000_00000_00000;
 
+/// https://developer.arm.com/documentation/ddi0602/2021-12/Base-Instructions/LDRH--immediate---Load-Register-Halfword--immediate--?lang=en
+const LDRH_IMM: u32 = 0b0111100101_000000000000_00000_00000;
 const LDRH_IMM_POST_INDEX_32: u32 = 0b01111000010_000000000_01_00000_00000;
 
 const LDRB_IMM: u32 = 0b0011100101_000000000000_00000_00000;
@@ -831,6 +834,7 @@ impl Assembler {
                 Instr::LdrImm(reg, reg1, imm) => {}
                 Instr::LdrImmPostIndex(reg, reg1, imm) => {}
                 Instr::LdrImmPreIndex(reg, reg1, imm) => {}
+                Instr::LdrhImm(_reg, _reg1, _imm) => {}
                 Instr::LdrhImmPostIndex(reg, reg1, imm) => {}
                 Instr::Ldrb(reg, reg1, reg2) => {}
                 Instr::LdrbImm(_, _, _) => {}
@@ -967,6 +971,14 @@ impl Assembler {
         assert!(offset.as_isize() < 256);
         assert!(offset.as_isize() >= -256);
         self.instrs.push(Instr::LdrhImmPostIndex(out, base, offset));
+    }
+
+    pub fn ldrh_imm(&mut self, out: Reg, base: Reg, offset: Imm) {
+        assert!(out.is_32bit());
+        assert!(base.is_64bit());
+        assert!(offset.as_usize() <= 8190);
+        assert!(offset.as_usize() % 2 == 0);
+        self.instrs.push(Instr::LdrhImm(out, base, offset));
     }
 
     // pub fn ldr_post_index(&mut self, out: Reg, base: Reg, offset: Imm) {
@@ -1782,6 +1794,19 @@ impl Assembler {
 
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
+            Instr::LdrhImm(out, base, offset) => {
+                assert!(out.is_32bit());
+                assert!(base.is_64bit());
+                assert!(offset.as_usize() <= 8190);
+                assert!(offset.as_usize() % 2 == 0);
+
+                let mut instrbits = LDRH_IMM;
+                instrbits.set_bit_range(4, 0, out.as_bits());
+                instrbits.set_bit_range(9, 5, base.as_bits());
+                instrbits.set_bit_range(21, 10, offset.as_u32() / 2);
+
+                outbuf.write_all(&instrbits.to_le_bytes())
+            }
             Instr::LdrhImmPostIndex(out, base, offset) => {
                 assert!(out.is_32bit());
                 assert!(base.is_64bit());
@@ -2336,6 +2361,14 @@ impl Instr {
                     out.as_asm(),
                     base.as_asm(),
                     offset.as_isize()
+                )
+            }
+            Instr::LdrhImm(out, base, offset) => {
+                format!(
+                    "ldrh\t{}, [{}, #{}]",
+                    out.as_asm(),
+                    base.as_asm(),
+                    offset.as_usize()
                 )
             }
             Instr::LdrImm(out, base, offset) => {
@@ -3415,6 +3448,139 @@ mod test {
         assert_eq!(func(34, 35), 35);
         let foo = black_box("nice");
         println!("{:?}", foo);
+    }
+
+    #[test]
+    fn test_assembler_ldrh() {
+        use Reg::*;
+
+        // Test basic unsigned offset ldrh: loads halfword (2 bytes) from [base + offset]
+        // Does NOT update base register (unlike pre/post-index)
+        {
+            let mut assembler = Assembler::new();
+            // ldrh w0, [x0, #4]  - load halfword from X0+4
+            assembler.ldrh_imm(W0, X0, Imm::U32(4));
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u32>(exec.addr) };
+
+            // Input: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]
+            // At offset 4: 0xEE, 0xFF -> 0xFFEE (little-endian)
+            let input = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+            let result = func(input.as_ptr());
+            assert_eq!(result, 0xFFEE);
+        }
+
+        // Test with zero offset
+        {
+            let mut assembler = Assembler::new();
+            // ldrh w0, [x0, #0]  - load halfword from X0
+            assembler.ldrh_imm(W0, X0, Imm::U32(0));
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u32>(exec.addr) };
+
+            // Input: [0x12, 0x34, ...]
+            // At offset 0: 0x12, 0x34 -> 0x3412 (little-endian)
+            let input = [0x12, 0x34, 0x56, 0x78];
+            let result = func(input.as_ptr());
+            assert_eq!(result, 0x3412);
+        }
+
+        // Test multiple loads at different offsets
+        {
+            let mut assembler = Assembler::new();
+            // Load three halfwords and sum them
+            assembler.ldrh_imm(W1, X0, Imm::U32(0)); // offset 0
+            assembler.ldrh_imm(W2, X0, Imm::U32(2)); // offset 2
+            assembler.ldrh_imm(W3, X0, Imm::U32(4)); // offset 4
+                                                     // Sum: W0 = W1 + W2 + W3
+            assembler.add(W0, W1, W2);
+            assembler.add(W0, W0, W3);
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u32>(exec.addr) };
+
+            // Input: [0x01, 0x00, 0x02, 0x00, 0x03, 0x00]
+            // offset 0: 0x0001
+            // offset 2: 0x0002
+            // offset 4: 0x0003
+            // sum = 1 + 2 + 3 = 6
+            let input = [0x01, 0x00, 0x02, 0x00, 0x03, 0x00];
+            let result = func(input.as_ptr());
+            assert_eq!(result, 6);
+        }
+
+        // Test that base register is NOT modified (unlike pre/post-index)
+        {
+            let mut assembler = Assembler::new();
+            // Save original pointer
+            assembler.mov(X1, X0);
+            // Load with offset
+            assembler.ldrh_imm(W2, X0, Imm::U32(8));
+            // Calculate difference (should be 0 since base isn't modified)
+            assembler.subs_ext_reg(X0, X0, X1);
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u64>(exec.addr) };
+
+            let input = [0u8; 20];
+            let result = func(input.as_ptr());
+            assert_eq!(result, 0); // Base register was NOT modified
+        }
+
+        // Test larger offset (max is 8190, must be even)
+        {
+            let mut assembler = Assembler::new();
+            // ldrh w0, [x0, #100]
+            assembler.ldrh_imm(W0, X0, Imm::U32(100));
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u32>(exec.addr) };
+
+            let mut input = [0u8; 150];
+            // Set halfword at offset 100 to 0xABCD
+            input[100] = 0xCD;
+            input[101] = 0xAB;
+            let result = func(input.as_ptr());
+            assert_eq!(result, 0xABCD);
+        }
+
+        // Test zero-extension: verify the loaded halfword is zero-extended to 32 bits
+        {
+            let mut assembler = Assembler::new();
+            // Load halfword from X0 (should zero-extend to 32 bits)
+            assembler.ldrh_imm(W0, X0, Imm::U32(0));
+            // Shift left by 16 - if zero-extended properly, upper bits should be 0
+            assembler.add_shift(W0, W0, W0, ShiftKind::Lsl, Imm::U32(16));
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u32>(exec.addr) };
+
+            // Input: 0x0002 (halfword value 2)
+            let input = [0x02, 0x00];
+            // If zero-extended: 0x00000002 + (0x00000002 << 16) = 0x00020002
+            let result = func(input.as_ptr());
+            assert_eq!(result, 0x00020002);
+        }
     }
 
     #[test]
