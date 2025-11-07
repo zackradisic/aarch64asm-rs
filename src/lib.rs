@@ -383,6 +383,25 @@ impl AsRef<str> for Label {
 }
 
 #[derive(PartialEq, Clone, Copy, Eq, Debug)]
+pub enum ShiftExtendKind {
+    Uxtw,
+    Lsl,
+    Sxtw,
+    Sxtx,
+}
+
+impl ShiftExtendKind {
+    pub fn as_asm(&self) -> &'static str {
+        match self {
+            ShiftExtendKind::Uxtw => "utxw",
+            ShiftExtendKind::Lsl => "lsl",
+            ShiftExtendKind::Sxtw => "sxtw",
+            ShiftExtendKind::Sxtx => "sxtx",
+        }
+    }
+}
+
+#[derive(PartialEq, Clone, Copy, Eq, Debug)]
 pub enum ShiftKind {
     Lsl,
     Lsr,
@@ -431,7 +450,7 @@ pub enum Instr {
     LdpPostIndex(Reg, Reg, Reg, Imm),
 
     Ldr(Reg, Reg, Reg),
-    LdrShift(Reg, Reg, Reg),
+    LdrShift(Reg, Reg, Reg, ShiftExtendKind),
     LdrImm(Reg, Reg, Imm),
     LdrImmPostIndex(Reg, Reg, Imm),
     LdrImmPreIndex(Reg, Reg, Imm),
@@ -838,7 +857,7 @@ impl Assembler {
                 Instr::StrShift(reg, reg1, reg2) => {}
                 Instr::StrbPostIndex(reg, reg1, imm) => {}
                 Instr::Ldr(reg, reg1, reg2) => {}
-                Instr::LdrShift(reg, reg1, reg2) => {}
+                Instr::LdrShift(reg, reg1, reg2, _) => {}
                 Instr::LdrImm(reg, reg1, imm) => {}
                 Instr::LdrImmPostIndex(reg, reg1, imm) => {}
                 Instr::LdrImmPreIndex(reg, reg1, imm) => {}
@@ -945,11 +964,12 @@ impl Assembler {
 
     /// For 32-bit, shifts the offset by 2 bits
     /// For 64-bit, shifts the offset by 3 bits
-    pub fn ldr_shift(&mut self, out: Reg, base: Reg, offset: Reg) {
+    pub fn ldr_shift(&mut self, out: Reg, base: Reg, offset: Reg, shift_ext_kind: ShiftExtendKind) {
         assert_ne!(out, Reg::SP);
         assert_ne!(offset, Reg::SP);
         assert!(base.is_64bit());
-        self.instrs.push(Instr::LdrShift(out, base, offset));
+        self.instrs
+            .push(Instr::LdrShift(out, base, offset, shift_ext_kind));
     }
 
     pub fn ldr_imm(&mut self, out: Reg, base: Reg, offset: Imm) {
@@ -1902,7 +1922,7 @@ impl Assembler {
 
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
-            Instr::LdrShift(out, base, offset) => {
+            Instr::LdrShift(out, base, offset, shift) => {
                 assert!(base.is_64bit());
 
                 let mut instrbits = if out.is_64bit() { LDR_64 } else { LDR_32 };
@@ -1911,7 +1931,12 @@ impl Assembler {
                 instrbits.set_bit_range(9, 5, base.as_bits());
                 instrbits.set_bit_range(20, 16, offset.as_bits());
                 instrbits.set_bit_range(12, 12, 0b1);
-                let option = if out.is_64bit() { 0b011 } else { 0b011 };
+                let option = match shift {
+                    ShiftExtendKind::Uxtw => 0b010,
+                    ShiftExtendKind::Lsl => 0b011,
+                    ShiftExtendKind::Sxtw => 0b110,
+                    ShiftExtendKind::Sxtx => 0b111,
+                };
                 instrbits.set_bit_range(15, 13, option);
 
                 outbuf.write_all(&instrbits.to_le_bytes())
@@ -2458,12 +2483,13 @@ impl Instr {
                     offset.as_asm()
                 )
             }
-            Instr::LdrShift(out, base, offset) => {
+            Instr::LdrShift(out, base, offset, ext) => {
                 let shift = if out.is_64bit() { 3 } else { 2 };
                 format!(
-                    "ldr\t{}, [{}, {}, lsl #{}]",
+                    "ldr\t{}, [{}, {}, {} #{}]",
                     out.as_asm(),
                     base.as_asm(),
+                    ext.as_asm(),
                     offset.as_asm(),
                     shift
                 )
@@ -3165,12 +3191,12 @@ mod test {
 
         asm.subs_ext_reg(XZR, SP, X1);
         asm.mov_imm(X2, 69.into());
-        asm.branch(CC::Eq, "OOGA".into());
+        asm.branch(CC::Eq, "OOGA");
 
         asm.add_imm(SP, SP, 32.into());
         asm.subs_ext_reg(XZR, SP, X1);
         asm.mov_imm(X2, 35.into());
-        asm.branch(CC::Eq, "OOGA".into());
+        asm.branch(CC::Eq, "OOGA");
 
         asm.mov_imm(X0, 420.into());
         asm.ret();
@@ -3800,7 +3826,7 @@ mod test {
         {
             let mut asm = Assembler::new();
             asm.mov_imm(X1, 1.into()); // offset = 1
-            asm.ldr_shift(X2, X0, X1); // load from [X0 + (1 << 3)] = [X0 + 8]
+            asm.ldr_shift(X2, X0, X1, ShiftExtendKind::Lsl); // load from [X0 + (1 << 3)] = [X0 + 8]
             asm.mov(X0, X2);
             asm.ret();
 
@@ -3817,7 +3843,7 @@ mod test {
         {
             let mut asm = Assembler::new();
             asm.mov_imm(X1, 2.into()); // offset = 2
-            asm.ldr_shift(W2, X0, X1); // load from [X0 + (2 << 2)] = [X0 + 8]
+            asm.ldr_shift(W2, X0, X1, ShiftExtendKind::Lsl); // load from [X0 + (2 << 2)] = [X0 + 8]
             asm.mov(X0, X2);
             asm.ret();
 
@@ -5001,6 +5027,113 @@ mod test {
             assert_eq!(func(1, 2), 1 + (2 << 4));
             assert_eq!(func(0, 0), 0);
             assert_eq!(func(10, 3), 10 + (3 << 4));
+        }
+    }
+
+    #[test]
+    fn test_ldr_shift_modes() {
+        use Reg::*;
+        use ShiftExtendKind::*;
+
+        // Test Lsl (Logical Shift Left) - most common for array indexing
+        // array[i] where each element is 8 bytes (64-bit)
+        {
+            let mut assembler = Assembler::new();
+            // X0 = base pointer (array)
+            // X1 = index (will be shifted left by 3 to multiply by 8)
+            // Result: load array[index]
+            assembler.ldr_shift(X0, X0, X1, Lsl);
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(*const u64, u64) -> u64>(exec.addr)
+            };
+
+            let array: [u64; 4] = [100, 200, 300, 400];
+            assert_eq!(func(array.as_ptr(), 0), 100);
+            assert_eq!(func(array.as_ptr(), 1), 200);
+            assert_eq!(func(array.as_ptr(), 2), 300);
+            assert_eq!(func(array.as_ptr(), 3), 400);
+        }
+
+        // Test Uxtw (Unsigned Extend Word) - zero-extend 32-bit index to 64-bit, then shift
+        {
+            let mut assembler = Assembler::new();
+            // X0 = base pointer
+            // W1 = 32-bit index (zero-extended to 64-bit, then shifted)
+            assembler.ldr_shift(X0, X0, X1, Uxtw);
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(*const u64, u32) -> u64>(exec.addr)
+            };
+
+            let array: [u64; 4] = [10, 20, 30, 40];
+            assert_eq!(func(array.as_ptr(), 0), 10);
+            assert_eq!(func(array.as_ptr(), 1), 20);
+            assert_eq!(func(array.as_ptr(), 2), 30);
+        }
+
+        // Test Sxtw (Signed Extend Word) - sign-extend 32-bit index to 64-bit, then shift
+        {
+            let mut assembler = Assembler::new();
+            // X0 = base pointer
+            // W1 = signed 32-bit index (sign-extended to 64-bit, then shifted)
+            assembler.ldr_shift(X0, X0, X1, Sxtw);
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(*const u64, i32) -> u64>(exec.addr)
+            };
+
+            let array: [u64; 4] = [111, 222, 333, 444];
+            assert_eq!(func(array.as_ptr(), 0), 111);
+            assert_eq!(func(array.as_ptr(), 1), 222);
+            assert_eq!(func(array.as_ptr(), 2), 333);
+        }
+
+        // Test Sxtx (Signed Extend Doubleword) - use full 64-bit register as-is, then shift
+        {
+            let mut assembler = Assembler::new();
+            // X0 = base pointer
+            // X1 = 64-bit index (used as-is, then shifted)
+            assembler.ldr_shift(X0, X0, X1, Sxtx);
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(*const u64, i64) -> u64>(exec.addr)
+            };
+
+            let array: [u64; 4] = [1000, 2000, 3000, 4000];
+            assert_eq!(func(array.as_ptr(), 0), 1000);
+            assert_eq!(func(array.as_ptr(), 1), 2000);
+            assert_eq!(func(array.as_ptr(), 3), 4000);
+        }
+
+        // Test with 32-bit loads (W registers)
+        {
+            let mut assembler = Assembler::new();
+            assembler.ldr_shift(W0, X0, X1, Lsl);
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(*const u32, u64) -> u32>(exec.addr)
+            };
+
+            let array: [u32; 4] = [50, 60, 70, 80];
+            assert_eq!(func(array.as_ptr(), 0), 50);
+            assert_eq!(func(array.as_ptr(), 1), 60);
+            assert_eq!(func(array.as_ptr(), 2), 70);
         }
     }
 }
