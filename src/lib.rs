@@ -384,9 +384,13 @@ impl AsRef<str> for Label {
 
 #[derive(PartialEq, Clone, Copy, Eq, Debug)]
 pub enum ShiftExtendKind {
+    /// Unsigned extend word
     Uxtw,
+    /// Logical shift left
     Lsl,
+    /// Sign-extend word
     Sxtw,
+    /// Sign-extend doubleword
     Sxtx,
 }
 
@@ -458,6 +462,8 @@ pub enum Instr {
     LdrhImm(Reg, Reg, Imm),
     LdrhImmPostIndex(Reg, Reg, Imm),
     Ldurh(Reg, Reg, Imm),
+
+    Ldursh(Reg, Reg, Imm),
 
     Ldrb(Reg, Reg, Reg),
     LdrbImm(Reg, Reg, Imm),
@@ -533,7 +539,10 @@ const LDRH_IMM: u32 = 0b0111100101_000000000000_00000_00000;
 const LDRH_IMM_POST_INDEX_32: u32 = 0b01111000010_000000000_01_00000_00000;
 
 /// https://developer.arm.com/documentation/ddi0602/2021-09/Base-Instructions/LDURH--Load-Register-Halfword--unscaled--
-const LDRUH: u32 = 0b01111000010_000000000_00_00000_00000;
+const LDURH: u32 = 0b01111000010_000000000_00_00000_00000;
+
+/// https://developer.arm.com/documentation/ddi0602/2021-09/Base-Instructions/LDURSH--Load-Register-Signed-Halfword--unscaled--
+const LDURSH: u32 = 0b011110001_0_0_000000000_00_00000_00000;
 
 /// https://developer.arm.com/documentation/ddi0602/2021-09/Base-Instructions/LDRB--immediate---Load-Register-Byte--immediate--
 const LDRB_IMM: u32 = 0b0011100101_000000000000_00000_00000;
@@ -864,6 +873,7 @@ impl Assembler {
                 Instr::LdrhImm(_reg, _reg1, _imm) => {}
                 Instr::LdrhImmPostIndex(reg, reg1, imm) => {}
                 Instr::Ldurh(_reg, _reg1, _imm) => {}
+                Instr::Ldursh(_reg, _reg1, _imm) => {}
                 Instr::Ldrb(_reg, _reg1, _reg2) => {}
                 Instr::LdrbImm(_, _, _) => {}
                 Instr::LdrbImmPostIndex(reg, reg1, imm) => {}
@@ -1010,12 +1020,19 @@ impl Assembler {
         self.instrs.push(Instr::LdrhImm(out, base, byte_offset));
     }
 
-    pub fn ldruh(&mut self, out: Reg, base: Reg, offset: Imm) {
+    pub fn ldurh(&mut self, out: Reg, base: Reg, offset: Imm) {
         assert!(out.is_32bit());
         assert!(base.is_64bit());
         assert!(offset.as_isize() <= 255);
         assert!(offset.as_isize() >= -256);
         self.instrs.push(Instr::Ldurh(out, base, offset));
+    }
+
+    pub fn ldursh(&mut self, out: Reg, base: Reg, offset: Imm) {
+        assert!(base.is_64bit());
+        assert!(offset.as_isize() >= -256);
+        assert!(offset.as_isize() < 255);
+        self.instrs.push(Instr::Ldursh(out, base, offset));
     }
 
     // pub fn ldr_post_index(&mut self, out: Reg, base: Reg, offset: Imm) {
@@ -1868,7 +1885,20 @@ impl Assembler {
                 assert!(offset.as_isize() <= 255);
                 assert!(offset.as_isize() >= -256);
 
-                let mut instrbits = LDRUH;
+                let mut instrbits = LDURH;
+                instrbits.set_bit_range(4, 0, out.as_bits());
+                instrbits.set_bit_range(9, 5, base.as_bits());
+                instrbits.set_bit_range(20, 12, offset.as_isize() as u32);
+
+                outbuf.write_all(&instrbits.to_le_bytes())
+            }
+            Instr::Ldursh(out, base, offset) => {
+                assert!(out.is_32bit());
+                assert!(base.is_64bit());
+                assert!(offset.as_isize() <= 255);
+                assert!(offset.as_isize() >= -256);
+
+                let mut instrbits = LDURSH;
                 instrbits.set_bit_range(4, 0, out.as_bits());
                 instrbits.set_bit_range(9, 5, base.as_bits());
                 instrbits.set_bit_range(20, 12, offset.as_isize() as u32);
@@ -2437,7 +2467,15 @@ impl Instr {
             }
             Instr::Ldurh(out, base, offset) => {
                 format!(
-                    "ldruh\t{}, [{}, #{}]",
+                    "ldurh\t{}, [{}, #{}]",
+                    out.as_asm(),
+                    base.as_asm(),
+                    offset.as_isize()
+                )
+            }
+            Instr::Ldursh(out, base, offset) => {
+                format!(
+                    "ldursh\t{}, [{}, #{}]",
                     out.as_asm(),
                     base.as_asm(),
                     offset.as_isize()
@@ -3674,7 +3712,7 @@ mod test {
         {
             let mut assembler = Assembler::new();
             // ldurh w0, [x0, #5]  - load halfword from X0+5 (odd offset)
-            assembler.ldruh(W0, X0, Imm::I16(5));
+            assembler.ldurh(W0, X0, Imm::I16(5));
             assembler.ret();
 
             let bytes = assembler.emit();
@@ -3695,7 +3733,7 @@ mod test {
             // Start at offset 10
             assembler.add_imm(X0, X0, Imm::U32(10));
             // ldurh w0, [x0, #-7]  - load halfword from X0-7
-            assembler.ldruh(W0, X0, Imm::I16(-7));
+            assembler.ldurh(W0, X0, Imm::I16(-7));
             assembler.ret();
 
             let bytes = assembler.emit();
@@ -3717,7 +3755,7 @@ mod test {
         {
             let mut assembler = Assembler::new();
             // ldurh w0, [x0, #0]
-            assembler.ldruh(W0, X0, Imm::I16(0));
+            assembler.ldurh(W0, X0, Imm::I16(0));
             assembler.ret();
 
             let bytes = assembler.emit();
@@ -3735,9 +3773,9 @@ mod test {
         {
             let mut assembler = Assembler::new();
             // Multiple unaligned loads
-            assembler.ldruh(W1, X0, Imm::I16(1)); // offset 1 (odd)
-            assembler.ldruh(W2, X0, Imm::I16(3)); // offset 3 (odd)
-            assembler.ldruh(W3, X0, Imm::I16(5)); // offset 5 (odd)
+            assembler.ldurh(W1, X0, Imm::I16(1)); // offset 1 (odd)
+            assembler.ldurh(W2, X0, Imm::I16(3)); // offset 3 (odd)
+            assembler.ldurh(W3, X0, Imm::I16(5)); // offset 5 (odd)
                                                   // Sum: W0 = W1 + W2 + W3
             assembler.add(W0, W1, W2);
             assembler.add(W0, W0, W3);
@@ -3762,7 +3800,7 @@ mod test {
         {
             let mut assembler = Assembler::new();
             assembler.mov(X1, X0);
-            assembler.ldruh(W2, X0, Imm::I16(7));
+            assembler.ldurh(W2, X0, Imm::I16(7));
             assembler.subs_ext_reg(X0, X0, X1);
             assembler.ret();
 
@@ -3779,7 +3817,7 @@ mod test {
         // Test maximum positive offset (255)
         {
             let mut assembler = Assembler::new();
-            assembler.ldruh(W0, X0, Imm::I16(255));
+            assembler.ldurh(W0, X0, Imm::I16(255));
             assembler.ret();
 
             let bytes = assembler.emit();
@@ -3801,7 +3839,7 @@ mod test {
             // Start at offset 256
             assembler.add_imm(X0, X0, Imm::U32(256));
             // Load from offset -256
-            assembler.ldruh(W0, X0, Imm::I16(-256));
+            assembler.ldurh(W0, X0, Imm::I16(-256));
             assembler.ret();
 
             let bytes = assembler.emit();
