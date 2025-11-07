@@ -1277,8 +1277,8 @@ impl Assembler {
         self.branch(cc, label);
     }
 
-    pub fn branch(&mut self, cc: CC, label: Label) {
-        self.instrs.push(Instr::Branch(cc, label));
+    pub fn branch<L: Into<Label>>(&mut self, cc: CC, label: L) {
+        self.instrs.push(Instr::Branch(cc, label.into()));
     }
 
     pub fn blr(&mut self, reg: Reg) {
@@ -4243,7 +4243,9 @@ mod test {
 
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8, u64) -> u32>(exec.addr) };
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(*const u8, u64) -> u32>(exec.addr)
+            };
 
             let input = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
 
@@ -4270,7 +4272,9 @@ mod test {
 
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8, u64) -> u32>(exec.addr) };
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(*const u8, u64) -> u32>(exec.addr)
+            };
 
             let input = [10, 20, 30, 40, 50];
             // Load input[2]=30 and input[3]=40, sum = 70
@@ -4289,7 +4293,9 @@ mod test {
 
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8, u64) -> u32>(exec.addr) };
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(*const u8, u64) -> u32>(exec.addr)
+            };
 
             let input = [0x02, 0x03];
             // Load 0x02, then 0x02 + (0x02 << 8) = 0x02 + 0x200 = 0x202
@@ -4301,9 +4307,9 @@ mod test {
         {
             let mut assembler = Assembler::new();
             // Save originals
-            assembler.mov(X2, X0);  // Save base
-            assembler.mov(X3, X1);  // Save offset
-            // Do the load
+            assembler.mov(X2, X0); // Save base
+            assembler.mov(X3, X1); // Save offset
+                                   // Do the load
             assembler.ldrb(W4, X0, X1);
             // Check base wasn't modified: X0 - X2 should be 0
             assembler.subs_ext_reg(X0, X0, X2);
@@ -4315,7 +4321,9 @@ mod test {
 
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8, u64) -> u64>(exec.addr) };
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(*const u8, u64) -> u64>(exec.addr)
+            };
 
             let input = [0u8; 10];
             let result = func(input.as_ptr(), 5);
@@ -4331,7 +4339,8 @@ mod test {
 
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u32>(exec.addr) };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u32>(exec.addr) };
 
             let input = [0x42, 0x43, 0x44];
             assert_eq!(func(input.as_ptr()), 0x42);
@@ -4341,19 +4350,20 @@ mod test {
         {
             let mut assembler = Assembler::new();
             // Load bytes at offsets 0, 1, 2 and sum them
-            assembler.ldrb(W2, X0, XZR);      // offset 0
+            assembler.ldrb(W2, X0, XZR); // offset 0
             assembler.mov_imm(X3, Imm::U32(1));
-            assembler.ldrb(W3, X0, X3);        // offset 1
+            assembler.ldrb(W3, X0, X3); // offset 1
             assembler.mov_imm(X4, Imm::U32(2));
-            assembler.ldrb(W4, X0, X4);        // offset 2
-            // Sum: W0 = W2 + W3 + W4
+            assembler.ldrb(W4, X0, X4); // offset 2
+                                        // Sum: W0 = W2 + W3 + W4
             assembler.add(W0, W2, W3);
             assembler.add(W0, W0, W4);
             assembler.ret();
 
             let bytes = assembler.emit();
             let exec = ExecutableMem::from_bytes_copy(&bytes);
-            let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u32>(exec.addr) };
+            let func =
+                unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u32>(exec.addr) };
 
             let input = [5, 10, 15];
             // Sum = 5 + 10 + 15 = 30
