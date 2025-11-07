@@ -516,10 +516,13 @@ const LDRH_IMM_POST_INDEX_32: u32 = 0b01111000010_000000000_01_00000_00000;
 /// https://developer.arm.com/documentation/ddi0602/2021-09/Base-Instructions/LDURH--Load-Register-Halfword--unscaled--
 const LDRUH: u32 = 0b01111000010_000000000_00_00000_00000;
 
+/// https://developer.arm.com/documentation/ddi0602/2021-09/Base-Instructions/LDRB--immediate---Load-Register-Byte--immediate--
 const LDRB_IMM: u32 = 0b0011100101_000000000000_00000_00000;
-
 const LDRB_IMM_POST_INDEX: u32 = 0b00111000010_000000000_0_1_00000_00000;
 const LDRB_IMM_PRE_INDEX: u32 = 0b00111000010_000000000_11_00000_00000;
+
+/// https://developer.arm.com/documentation/ddi0602/2021-09/Base-Instructions/LDRB--register---Load-Register-Byte--register--
+const LDRB: u32 = 0b00111000011_00000_000_0_10_00000_00000;
 
 // const LDR_IMM_POST_INDEX: u32 = 0b01001000010_00000000000000000000000_00000;
 const LDR32_IMM_POST_INDEX: u32 = 0b10111000010_000000000_01_00000_00000;
@@ -842,7 +845,7 @@ impl Assembler {
                 Instr::LdrhImm(_reg, _reg1, _imm) => {}
                 Instr::LdrhImmPostIndex(reg, reg1, imm) => {}
                 Instr::Ldurh(_reg, _reg1, _imm) => {}
-                Instr::Ldrb(reg, reg1, reg2) => {}
+                Instr::Ldrb(_reg, _reg1, _reg2) => {}
                 Instr::LdrbImm(_, _, _) => {}
                 Instr::LdrbImmPostIndex(reg, reg1, imm) => {}
                 Instr::LdrbImmPreIndex(reg, reg1, imm) => {}
@@ -998,6 +1001,13 @@ impl Assembler {
     // pub fn ldr_post_index(&mut self, out: Reg, base: Reg, offset: Imm) {
     //     self.instrs.push(Instr::LdrPostIndex(out, base, offset));
     // }
+
+    /// ldrb with zero extending offset
+    pub fn ldrb(&mut self, out: Reg, base: Reg, offset: Reg) {
+        assert!(out.is_32bit());
+        assert!(base.is_64bit());
+        self.instrs.push(Instr::Ldrb(out, base, offset));
+    }
 
     pub fn ldrb_imm(&mut self, out: Reg, base: Reg, offset: Imm) {
         assert!(out.is_32bit());
@@ -1841,7 +1851,7 @@ impl Assembler {
                 let mut instrbits = LDRUH;
                 instrbits.set_bit_range(4, 0, out.as_bits());
                 instrbits.set_bit_range(9, 5, base.as_bits());
-                instrbits.set_bit_range(20, 12, offset.as_u32());
+                instrbits.set_bit_range(20, 12, offset.as_isize() as u32);
 
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
@@ -1907,7 +1917,17 @@ impl Assembler {
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
             Instr::Ldrb(out, base, offset) => {
-                todo!()
+                assert!(out.is_32bit());
+                assert!(base.is_64bit());
+
+                let mut instrbits = LDRB;
+
+                instrbits.set_bit_range(4, 0, out.as_bits());
+                instrbits.set_bit_range(9, 5, base.as_bits());
+                instrbits.set_bit_range(20, 16, offset.as_bits());
+                instrbits.set_bit_range(15, 13, 0b010);
+
+                outbuf.write_all(&instrbits.to_le_bytes())
             }
             Instr::LdrbImm(out, base, offset) => {
                 assert!(out.is_32bit());
@@ -4209,6 +4229,140 @@ mod test {
 
     #[test]
     fn test_assembler_ldrb() {
+        use Reg::*;
+
+        // Test basic register offset ldrb: loads byte from [base + offset_reg]
+        // Syntax: ldrb w0, [x1, x2] where x2 contains the offset
+        {
+            let mut assembler = Assembler::new();
+            // X0 = pointer to byte array (first parameter)
+            // X1 = offset value (second parameter)
+            // ldrb w0, [x0, x1] - load byte from X0 + X1
+            assembler.ldrb(W0, X0, X1);
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8, u64) -> u32>(exec.addr) };
+
+            let input = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+            // Test various offsets
+            assert_eq!(func(input.as_ptr(), 0), 0xAA);
+            assert_eq!(func(input.as_ptr(), 1), 0xBB);
+            assert_eq!(func(input.as_ptr(), 2), 0xCC);
+            assert_eq!(func(input.as_ptr(), 5), 0xFF);
+        }
+
+        // Test with calculated offset
+        {
+            let mut assembler = Assembler::new();
+            // X0 = array pointer
+            // X1 = index to load
+            // Calculate offset: X2 = X1 (just use X1 as offset)
+            assembler.ldrb(W2, X0, X1);
+            // Load another byte at X1 + 1
+            assembler.add_imm(X3, X1, Imm::U32(1));
+            assembler.ldrb(W3, X0, X3);
+            // Return W2 + W3
+            assembler.add(W0, W2, W3);
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8, u64) -> u32>(exec.addr) };
+
+            let input = [10, 20, 30, 40, 50];
+            // Load input[2]=30 and input[3]=40, sum = 70
+            assert_eq!(func(input.as_ptr(), 2), 70);
+            // Load input[0]=10 and input[1]=20, sum = 30
+            assert_eq!(func(input.as_ptr(), 0), 30);
+        }
+
+        // Test zero-extension: byte should be zero-extended to 32 bits
+        {
+            let mut assembler = Assembler::new();
+            // Load byte and shift left - if properly zero-extended, upper bits are 0
+            assembler.ldrb(W0, X0, X1);
+            assembler.add_shift(W0, W0, W0, ShiftKind::Lsl, Imm::U32(8));
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8, u64) -> u32>(exec.addr) };
+
+            let input = [0x02, 0x03];
+            // Load 0x02, then 0x02 + (0x02 << 8) = 0x02 + 0x200 = 0x202
+            let result = func(input.as_ptr(), 0);
+            assert_eq!(result, 0x202);
+        }
+
+        // Test that neither base nor offset registers are modified
+        {
+            let mut assembler = Assembler::new();
+            // Save originals
+            assembler.mov(X2, X0);  // Save base
+            assembler.mov(X3, X1);  // Save offset
+            // Do the load
+            assembler.ldrb(W4, X0, X1);
+            // Check base wasn't modified: X0 - X2 should be 0
+            assembler.subs_ext_reg(X0, X0, X2);
+            // Check offset wasn't modified: X1 - X3 should be 0
+            assembler.subs_ext_reg(X1, X1, X3);
+            // Return X0 + X1 (both should be 0)
+            assembler.add(X0, X0, X1);
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8, u64) -> u64>(exec.addr) };
+
+            let input = [0u8; 10];
+            let result = func(input.as_ptr(), 5);
+            assert_eq!(result, 0); // Neither register was modified
+        }
+
+        // Test with zero register offset
+        {
+            let mut assembler = Assembler::new();
+            // ldrb w0, [x0, xzr] - offset is 0
+            assembler.ldrb(W0, X0, XZR);
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u32>(exec.addr) };
+
+            let input = [0x42, 0x43, 0x44];
+            assert_eq!(func(input.as_ptr()), 0x42);
+        }
+
+        // Test sequential loads with different offset registers
+        {
+            let mut assembler = Assembler::new();
+            // Load bytes at offsets 0, 1, 2 and sum them
+            assembler.ldrb(W2, X0, XZR);      // offset 0
+            assembler.mov_imm(X3, Imm::U32(1));
+            assembler.ldrb(W3, X0, X3);        // offset 1
+            assembler.mov_imm(X4, Imm::U32(2));
+            assembler.ldrb(W4, X0, X4);        // offset 2
+            // Sum: W0 = W2 + W3 + W4
+            assembler.add(W0, W2, W3);
+            assembler.add(W0, W0, W4);
+            assembler.ret();
+
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe { std::mem::transmute::<_, extern "C" fn(*const u8) -> u32>(exec.addr) };
+
+            let input = [5, 10, 15];
+            // Sum = 5 + 10 + 15 = 30
+            assert_eq!(func(input.as_ptr()), 30);
+        }
+    }
+
+    #[test]
+    fn test_assembler_ldrb_post_index() {
         use Reg::*;
         let mut assembler = Assembler::new();
         let fail = Label(assembler.new_label("FAIL"));
