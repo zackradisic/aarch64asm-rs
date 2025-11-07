@@ -2265,7 +2265,6 @@ impl Assembler {
                 instrbits.set_bit_range(22, 21, 0);
 
                 let val: u32 = u32::from_le_bytes(instrbits.to_le_bytes());
-                println!("MOV_IMM: {:?}", val);
 
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
@@ -2310,8 +2309,6 @@ impl Assembler {
             Instr::Ret => {
                 let mut instrbits: u32 = 0b1101011001011111000000_00000_00000;
                 instrbits.set_bit_range(9, 5, 30);
-                let val: u32 = u32::from_le_bytes(instrbits.to_le_bytes());
-                println!("RET: {:?}", val);
                 outbuf.write_all(&instrbits.to_le_bytes())
             }
         }
