@@ -1,6 +1,7 @@
 #![feature(variant_count)]
 use std::ffi::{c_int, c_void};
 
+use std::ops::{Index, Range};
 use std::process::Output;
 use std::{collections::HashMap, io::Write, ops::Neg};
 
@@ -24,6 +25,9 @@ extern "C" {
     fn munmap(addr: *mut c_void, length: usize) -> c_int;
     #[cfg(target_os = "macos")]
     fn pthread_jit_write_protect_np(enabled: c_int) -> c_void;
+    #[cfg(target_os = "macos")]
+    fn sys_icache_invalidate(addr: *mut c_void, length: usize);
+    fn mprotect(addr: *mut c_void, length: usize, prot: c_int) -> c_int;
 }
 
 #[derive(Debug)]
@@ -67,6 +71,14 @@ impl ExecutableMem {
         )
     }
 
+    pub fn prepare_for_exec(&self) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            sys_icache_invalidate(self.addr as *mut c_void, self.len);
+            mprotect(self.addr as *mut c_void, self.len, 5);
+        }
+    }
+
     pub fn capacity(capacity: usize) -> Self {
         ExecutableMem::init_with_fn(capacity, None::<fn(*mut u8)>)
     }
@@ -103,6 +115,13 @@ impl ExecutableMem {
         Self::write_protect(false);
         ExecutableMemWriter::new(self)
     }
+
+    pub fn as_writer_with_offset<'a>(&'a mut self, offset: usize) -> ExecutableMemWriter<'a> {
+        Self::write_protect(false);
+        let mut writer = ExecutableMemWriter::new(self);
+        writer.len = offset;
+        writer
+    }
 }
 
 impl Drop for ExecutableMem {
@@ -112,8 +131,8 @@ impl Drop for ExecutableMem {
 }
 
 pub struct ExecutableMemWriter<'a> {
-    mem: &'a mut ExecutableMem,
-    len: usize,
+    pub mem: &'a mut ExecutableMem,
+    pub len: usize,
 }
 
 impl<'a> ExecutableMemWriter<'a> {
@@ -427,6 +446,7 @@ impl ShiftKind {
 #[derive(Debug)]
 pub enum Instr {
     Adr(Reg, Label),
+    AdrOffset(Reg, i64),
     Ands(Reg, Reg, Imm),
 
     Br(Reg),
@@ -850,6 +870,7 @@ impl Assembler {
                 Instr::Adr(_, l) => {
                     // TODO: Can we omit this? It owuld
                 }
+                Instr::AdrOffset(_, _) => {}
                 Instr::Ands(reg, reg1, imm) => {}
                 Instr::Stp(reg, reg1, reg2, imm) => {}
                 Instr::SubsExtReg(reg, reg1, reg2) => {}
@@ -1283,6 +1304,12 @@ impl Assembler {
         self.instrs.push(Instr::Adr(out, label));
     }
 
+    pub fn adr_offset(&mut self, out: Reg, relative_offset: i64) {
+        assert!(relative_offset >= -1024 * 1024);
+        assert!(relative_offset <= 1024 * 1024);
+        self.instrs.push(Instr::AdrOffset(out, relative_offset));
+    }
+
     pub fn ands(&mut self, out: Reg, a: Reg, mask: u64) {
         assert_eq!(out.is_64bit(), a.is_64bit());
         let encoded = encode_bitmask_immediate(mask, out.is_64bit())
@@ -1514,6 +1541,25 @@ impl Assembler {
                 assert!(label_bits_signed >= -(1 << 20));
 
                 let label_bits = (label_index * 4) as u64;
+                instr_bits.set_bit_range(4, 0, reg.as_bits());
+                let low_two_bits: u32 = label_bits.bit_range(1, 0);
+                instr_bits.set_bit_range(30, 29, low_two_bits);
+                let rest_of_bits: u32 = label_bits.bit_range(20, 2);
+                instr_bits.set_bit_range(23, 5, rest_of_bits);
+
+                outbuf.write_all(&instr_bits.to_le_bytes())
+            }
+            Instr::AdrOffset(reg, l) => {
+                assert!(reg.is_64bit());
+                let mut instr_bits = ADR;
+
+                let label_bits_signed: i64 = *l;
+
+                // Must be in the range of +/-1mb
+                assert!(label_bits_signed <= (1 << 20));
+                assert!(label_bits_signed >= -(1 << 20));
+
+                let label_bits = label_bits_signed as u64;
                 instr_bits.set_bit_range(4, 0, reg.as_bits());
                 let low_two_bits: u32 = label_bits.bit_range(1, 0);
                 instr_bits.set_bit_range(30, 29, low_two_bits);
@@ -2375,6 +2421,9 @@ impl Instr {
             }
             Instr::Adr(reg, label) => {
                 format!("adr\t{}, .L{}", reg.as_asm(), label.as_ref())
+            }
+            Instr::AdrOffset(reg, l) => {
+                format!("adr\t{}, #{}", reg.as_asm(), l)
             }
             Instr::Csinc(dest, a, b, cc) => {
                 format!(
@@ -4681,6 +4730,25 @@ mod test {
             let func =
                 unsafe { std::mem::transmute::<_, extern "C" fn(usize) -> usize>(exec.addr) };
             assert_eq!(func(0), 0);
+        }
+    }
+
+    #[test]
+    fn test_assembler_add_negative() {
+        use Reg::*;
+        {
+            let mut assembler = Assembler::new();
+            assembler.add(X0, X0, X1);
+            assembler.ret();
+            let bytes = assembler.emit();
+            let exec = ExecutableMem::from_bytes_copy(&bytes);
+            let func = unsafe {
+                std::mem::transmute::<_, extern "C" fn(isize, isize) -> isize>(exec.addr)
+            };
+            assert_eq!(func(0, -1), -1);
+            assert_eq!(func(1, -1), 0);
+            assert_eq!(func(2, -1), 1);
+            assert_eq!(func(34, -1), 33);
         }
     }
 
